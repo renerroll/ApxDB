@@ -1,0 +1,11 @@
+build/
+.dart_tool/
+.packages
+pubspec.lock
+android/.gradle
+ios/Pods/
+macos/Flutter/ephemeral/
+**/DerivedData/
+*.iml
+.idea/
+.vscode/

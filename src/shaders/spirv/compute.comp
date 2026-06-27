@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Values {
+    int data[];
+} values;
+
+layout(std430, binding = 1) writeonly buffer Matches {
+    uint data[];
+} matches;
+
+layout(std430, binding = 2) readonly buffer Params {
+    int op;
+    int threshold;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    int value = values.data[idx];
+    bool valid = value != int(-2147483648);
+    bool match = false;
+    if (valid) {
+        if (params.op == 0) {
+            match = value == params.threshold;
+        } else if (params.op == 1) {
+            match = value > params.threshold;
+        } else if (params.op == 2) {
+            match = value >= params.threshold;
+        } else if (params.op == 3) {
+            match = value < params.threshold;
+        } else if (params.op == 4) {
+            match = value <= params.threshold;
+        }
+    }
+    matches.data[idx] = match ? 1u : 0u;
+}

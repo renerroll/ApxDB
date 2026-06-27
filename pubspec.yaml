@@ -1,0 +1,22 @@
+name: apxdb
+description: Flutter plugin for a cross-platform Vulkan/Metal compute-backed document NoSQL store via FFI.
+publish_to: "none"
+version: 0.0.1
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.0.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.0.1
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.example.apxdb
+        pluginClass: ApxdbPlugin
+      ios:
+        pluginClass: ApxdbPlugin
+      macos:
+        pluginClass: ApxdbPlugin
