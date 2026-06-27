@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
@@ -25,6 +27,7 @@ typedef struct {
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_initialized = false;
 static bool g_gpu_available = false;
+static char* g_storage_directory = NULL;
 static apxdb_document_t* g_documents = NULL;
 static size_t g_document_count = 0;
 static size_t g_document_capacity = 0;
@@ -75,6 +78,45 @@ static void free_documents(void) {
   g_document_capacity = 0;
 }
 
+static bool ensure_directory_exists(const char* path) {
+  if (!path) {
+    return false;
+  }
+  struct stat st;
+  if (stat(path, &st) == 0) {
+    return S_ISDIR(st.st_mode);
+  }
+  if (errno != ENOENT) {
+    return false;
+  }
+  return mkdir(path, 0755) == 0;
+}
+
+static void init_gpu_backend(void);
+
+static bool set_storage_directory(const char* directory_path) {
+  if (!directory_path) {
+    return false;
+  }
+  char* next = allocate_utf8_string(directory_path);
+  if (!next) {
+    return false;
+  }
+  free(g_storage_directory);
+  g_storage_directory = next;
+  return true;
+}
+
+static int32_t initialize_internal(void) {
+  free_documents();
+  atomic_store(&g_document_counter, 0);
+  g_initialized = true;
+  init_gpu_backend();
+  return 0;
+}
+
+static void cleanup_gpu_backend(void);
+
 #ifdef __ANDROID__
 static VkInstance g_vk_instance = VK_NULL_HANDLE;
 static VkPhysicalDevice g_vk_physical_device = VK_NULL_HANDLE;
@@ -89,9 +131,11 @@ static VkDescriptorPool g_vk_descriptor_pool = VK_NULL_HANDLE;
 
 static bool initialize_vulkan_backend(void);
 static bool run_vulkan_query_int(const int32_t* values, const uint32_t* valid_mask, size_t count, int op, int32_t threshold, uint8_t* out_mask);
+static void cleanup_vulkan_backend(void);
 #endif
 
 #ifdef __OBJC__
+static void cleanup_metal_backend(void);
 static id<MTLDevice> g_metal_device = nil;
 static id<MTLCommandQueue> g_metal_command_queue = nil;
 static id<MTLLibrary> g_metal_library = nil;
@@ -139,10 +183,24 @@ static bool initialize_metal_backend(void) {
   }
   id<MTLFunction> function = [g_metal_library newFunctionWithName:@"documentCompute"];
   if (!function) {
+    cleanup_metal_backend();
     return false;
   }
   g_metal_pipeline = [g_metal_device newComputePipelineStateWithFunction:function error:&error];
-  return g_metal_pipeline != nil;
+  if (!g_metal_pipeline) {
+    cleanup_metal_backend();
+    return false;
+  }
+  return true;
+}
+
+static void cleanup_metal_backend(void) {
+#ifdef __OBJC__
+  g_metal_pipeline = nil;
+  g_metal_library = nil;
+  g_metal_command_queue = nil;
+  g_metal_device = nil;
+#endif
 }
 #endif
 
@@ -205,6 +263,7 @@ static bool initialize_vulkan_backend(void) {
   VkInstanceCreateInfo instance_info = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
   instance_info.pApplicationInfo = &app_info;
   if (vkCreateInstance(&instance_info, NULL, &g_vk_instance) != VK_SUCCESS) {
+    cleanup_vulkan_backend();
     return false;
   }
 
@@ -218,6 +277,7 @@ static bool initialize_vulkan_backend(void) {
     physical_device_count = 8;
   }
   if (vkEnumeratePhysicalDevices(g_vk_instance, &physical_device_count, physical_devices) != VK_SUCCESS) {
+    cleanup_vulkan_backend();
     return false;
   }
 
@@ -250,6 +310,7 @@ static bool initialize_vulkan_backend(void) {
   }
 
   if (g_vk_physical_device == VK_NULL_HANDLE || g_vk_queue_family == UINT32_MAX) {
+    cleanup_vulkan_backend();
     return false;
   }
 
@@ -264,6 +325,7 @@ static bool initialize_vulkan_backend(void) {
   device_create_info.pQueueCreateInfos = &queue_create_info;
 
   if (vkCreateDevice(g_vk_physical_device, &device_create_info, NULL, &g_vk_device) != VK_SUCCESS) {
+    cleanup_vulkan_backend();
     return false;
   }
 
@@ -273,6 +335,7 @@ static bool initialize_vulkan_backend(void) {
   command_pool_info.queueFamilyIndex = g_vk_queue_family;
   command_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
   if (vkCreateCommandPool(g_vk_device, &command_pool_info, NULL, &g_vk_command_pool) != VK_SUCCESS) {
+    cleanup_vulkan_backend();
     return false;
   }
 
@@ -348,10 +411,48 @@ static bool initialize_vulkan_backend(void) {
   descriptor_pool_info.pPoolSizes = pool_sizes;
   descriptor_pool_info.maxSets = 1;
   if (vkCreateDescriptorPool(g_vk_device, &descriptor_pool_info, NULL, &g_vk_descriptor_pool) != VK_SUCCESS) {
+    cleanup_vulkan_backend();
     return false;
   }
 
   return true;
+}
+
+static void cleanup_vulkan_backend(void) {
+  if (g_vk_device != VK_NULL_HANDLE) {
+    vkDeviceWaitIdle(g_vk_device);
+  }
+  if (g_vk_pipeline != VK_NULL_HANDLE) {
+    vkDestroyPipeline(g_vk_device, g_vk_pipeline, NULL);
+    g_vk_pipeline = VK_NULL_HANDLE;
+  }
+  if (g_vk_pipeline_layout != VK_NULL_HANDLE) {
+    vkDestroyPipelineLayout(g_vk_device, g_vk_pipeline_layout, NULL);
+    g_vk_pipeline_layout = VK_NULL_HANDLE;
+  }
+  if (g_vk_descriptor_pool != VK_NULL_HANDLE) {
+    vkDestroyDescriptorPool(g_vk_device, g_vk_descriptor_pool, NULL);
+    g_vk_descriptor_pool = VK_NULL_HANDLE;
+  }
+  if (g_vk_descriptor_set_layout != VK_NULL_HANDLE) {
+    vkDestroyDescriptorSetLayout(g_vk_device, g_vk_descriptor_set_layout, NULL);
+    g_vk_descriptor_set_layout = VK_NULL_HANDLE;
+  }
+  if (g_vk_command_pool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(g_vk_device, g_vk_command_pool, NULL);
+    g_vk_command_pool = VK_NULL_HANDLE;
+  }
+  if (g_vk_device != VK_NULL_HANDLE) {
+    vkDestroyDevice(g_vk_device, NULL);
+    g_vk_device = VK_NULL_HANDLE;
+  }
+  if (g_vk_instance != VK_NULL_HANDLE) {
+    vkDestroyInstance(g_vk_instance, NULL);
+    g_vk_instance = VK_NULL_HANDLE;
+  }
+  g_vk_physical_device = VK_NULL_HANDLE;
+  g_vk_queue = VK_NULL_HANDLE;
+  g_vk_queue_family = UINT32_MAX;
 }
 
 static bool run_vulkan_query_int(const int32_t* values, const uint32_t* valid_mask, size_t count, int op, int32_t threshold, uint8_t* out_mask) {
@@ -589,11 +690,13 @@ bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t
 static void init_gpu_backend(void) {
 #ifdef __APPLE__
 #ifdef __OBJC__
+  cleanup_gpu_backend();
   g_gpu_available = initialize_metal_backend();
 #else
   g_gpu_available = false;
 #endif
 #elif defined(__ANDROID__)
+  cleanup_gpu_backend();
   g_gpu_available = initialize_vulkan_backend();
 #else
   g_gpu_available = false;
@@ -622,12 +725,93 @@ int32_t apxdb_shutdown() {
     return 0;
   }
 
+  cleanup_gpu_backend();
   free_documents();
   apxdb_collection_unregister_all();
   apxdb_schema_unregister_all();
+  free(g_storage_directory);
+  g_storage_directory = NULL;
   g_initialized = false;
   pthread_mutex_unlock(&g_mutex);
   return 0;
+}
+
+int32_t apxdb_open(const char* directory_path) {
+  if (!directory_path) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&g_mutex);
+  if (g_initialized) {
+    pthread_mutex_unlock(&g_mutex);
+    return 0;
+  }
+
+  if (!ensure_directory_exists(directory_path)) {
+    pthread_mutex_unlock(&g_mutex);
+    return -1;
+  }
+
+  initialize_internal();
+  if (!set_storage_directory(directory_path)) {
+    cleanup_gpu_backend();
+    g_initialized = false;
+    pthread_mutex_unlock(&g_mutex);
+    return -1;
+  }
+
+  // TODO: Week 2 - support persistent .idx index files and schema version checks.
+  if (apxdb_load_all_collections(directory_path) != 0) {
+    cleanup_gpu_backend();
+    apxdb_collection_unregister_all();
+    apxdb_schema_unregister_all();
+    free(g_storage_directory);
+    g_storage_directory = NULL;
+    g_initialized = false;
+    pthread_mutex_unlock(&g_mutex);
+    return -1;
+  }
+
+  pthread_mutex_unlock(&g_mutex);
+  return 0;
+}
+
+int32_t apxdb_close(void) {
+  pthread_mutex_lock(&g_mutex);
+  if (!g_initialized) {
+    pthread_mutex_unlock(&g_mutex);
+    return 0;
+  }
+
+  int32_t result = 0;
+  if (g_storage_directory) {
+    if (apxdb_save_all_collections(g_storage_directory) != 0) {
+      result = -1;
+    }
+  }
+
+  cleanup_gpu_backend();
+  free_documents();
+  apxdb_collection_unregister_all();
+  apxdb_schema_unregister_all();
+  free(g_storage_directory);
+  g_storage_directory = NULL;
+  g_initialized = false;
+  pthread_mutex_unlock(&g_mutex);
+  return result;
+}
+
+static void cleanup_gpu_backend(void) {
+#ifdef __APPLE__
+#ifdef __OBJC__
+  cleanup_metal_backend();
+#endif
+#elif defined(__ANDROID__)
+  cleanup_vulkan_backend();
+#else
+  (void)0;
+#endif
+  g_gpu_available = false;
 }
 
 const char* apxdb_create_document(const char* json_utf8) {

@@ -11,6 +11,8 @@ extern "C" {
 
 int32_t apxdb_initialize();
 int32_t apxdb_shutdown();
+int32_t apxdb_open(const char* directory_path);
+int32_t apxdb_close(void);
 const char* apxdb_create_document(const char* json_utf8);
 const char* apxdb_find_document(const char* query_utf8);
 void apxdb_release_string(const char* utf8);

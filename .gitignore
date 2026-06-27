@@ -9,3 +9,4 @@ macos/Flutter/ephemeral/
 *.iml
 .idea/
 .vscode/
+*.md

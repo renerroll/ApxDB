@@ -40,6 +40,7 @@ struct apxdb_collection_t {
   apxdb_index_data_t* index_data;
   size_t index_data_count;
   size_t index_data_capacity;
+  bool dirty;
 };
 
 struct apxdb_query_t {
@@ -1466,9 +1467,13 @@ int32_t apxdb_save_all_collections(const char* directory_path) {
     if (!format_collection_file_path(directory_path, g_collections[i]->schema->collection_name, path, sizeof(path))) {
       return -1;
     }
+    if (!g_collections[i]->dirty) {
+      continue;
+    }
     if (!save_collection_to_file(g_collections[i], path)) {
       return -1;
     }
+    g_collections[i]->dirty = false;
   }
   return 0;
 }
@@ -1680,6 +1685,7 @@ static bool load_collection_from_file(apxdb_collection_t* collection, const char
   }
 
   fclose(file);
+  collection->dirty = false;
   return true;
 }
 
@@ -2623,6 +2629,7 @@ int32_t apxdb_delete_document(const char* collection_name, const char* id) {
         collection->documents[j - 1] = collection->documents[j];
       }
       collection->document_count -= 1;
+      collection->dirty = true;
       return 0;
     }
   }
@@ -2637,7 +2644,11 @@ int32_t apxdb_save_collection(const char* collection_name, const char* file_path
   if (!collection) {
     return -1;
   }
-  return save_collection_to_file(collection, file_path) ? 0 : -1;
+  bool saved = save_collection_to_file(collection, file_path);
+  if (saved) {
+    collection->dirty = false;
+  }
+  return saved ? 0 : -1;
 }
 
 int32_t apxdb_load_collection(const char* collection_name, const char* file_path) {
