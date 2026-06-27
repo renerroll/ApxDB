@@ -26,7 +26,9 @@ typedef struct {
 
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_initialized = false;
+static apxdb_state_t g_state = APXDB_STATE_CLOSED;
 static bool g_gpu_available = false;
+static apxdb_gpu_status_t g_gpu_status = APXDB_GPU_UNAVAILABLE;
 static char* g_storage_directory = NULL;
 static apxdb_document_t* g_documents = NULL;
 static size_t g_document_count = 0;
@@ -78,7 +80,7 @@ static void free_documents(void) {
   g_document_capacity = 0;
 }
 
-static bool ensure_directory_exists(const char* path) {
+static bool ensure_directory_exists_native(const char* path) {
   if (!path) {
     return false;
   }
@@ -93,7 +95,9 @@ static bool ensure_directory_exists(const char* path) {
 }
 
 static void init_gpu_backend(void);
-
+static void transition_to_closed(void);
+static void cleanup_partial_open(void);
+static void set_state(apxdb_state_t state);static void set_gpu_status(apxdb_gpu_status_t status);
 static bool set_storage_directory(const char* directory_path) {
   if (!directory_path) {
     return false;
@@ -110,12 +114,49 @@ static bool set_storage_directory(const char* directory_path) {
 static int32_t initialize_internal(void) {
   free_documents();
   atomic_store(&g_document_counter, 0);
-  g_initialized = true;
   init_gpu_backend();
-  return 0;
+  return g_gpu_available ? APXDB_OK : APXDB_OK_GPU_FALLBACK;
+}
+
+int32_t apxdb_gpu_status(void) {
+  pthread_mutex_lock(&g_mutex);
+  int32_t status = (int32_t)g_gpu_status;
+  pthread_mutex_unlock(&g_mutex);
+  return status;
 }
 
 static void cleanup_gpu_backend(void);
+static void set_state(apxdb_state_t state) {
+  g_state = state;
+  g_initialized = (state == APXDB_STATE_OPEN);
+}
+
+static void set_gpu_status(apxdb_gpu_status_t status) {
+  g_gpu_status = status;
+}
+
+static void transition_to_closed(void) {
+  if (g_storage_directory) {
+    apxdb_save_all_collections(g_storage_directory);
+  }
+  cleanup_gpu_backend();
+  free_documents();
+  apxdb_collection_unregister_all();
+  apxdb_schema_unregister_all();
+  free(g_storage_directory);
+  g_storage_directory = NULL;
+  set_state(APXDB_STATE_CLOSED);
+}
+
+static void cleanup_partial_open(void) {
+  cleanup_gpu_backend();
+  free_documents();
+  apxdb_collection_unregister_all();
+  apxdb_schema_unregister_all();
+  free(g_storage_directory);
+  g_storage_directory = NULL;
+  g_initialized = false;
+}
 
 #ifdef __ANDROID__
 static VkInstance g_vk_instance = VK_NULL_HANDLE;
@@ -419,8 +460,26 @@ static bool initialize_vulkan_backend(void) {
 }
 
 static void cleanup_vulkan_backend(void) {
+  // Правильний порядок destroy:
+  // 1. vkFreeCommandBuffers()        - free outstanding command buffers
+  // 2. vkDestroyCommandPool()         - destroy the pool after buffers are freed
+  // 3. vkDestroyPipeline()            - destroy compute pipeline
+  // 4. vkDestroyPipelineLayout()      - destroy pipeline layout
+  // 5. vkDestroyDescriptorSetLayout() - destroy descriptor set layout
+  // 6. vkDestroyDescriptorPool()      - destroy descriptor pool
+  // 7. vkDestroyShaderModule()        - destroy shader module if retained
+  // 8. vkFreeMemory() for all buffers - free any buffer memory
+  // 9. vkDestroyBuffer()              - destroy any buffers
+  // 10. vkDestroyDevice()             - destroy the logical device
+  // 11. vkDestroyInstance()           - destroy the Vulkan instance last
+  // Note: buffer and command buffer cleanup is handled per-query in run_vulkan_query_int().
+
   if (g_vk_device != VK_NULL_HANDLE) {
     vkDeviceWaitIdle(g_vk_device);
+  }
+  if (g_vk_command_pool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(g_vk_device, g_vk_command_pool, NULL);
+    g_vk_command_pool = VK_NULL_HANDLE;
   }
   if (g_vk_pipeline != VK_NULL_HANDLE) {
     vkDestroyPipeline(g_vk_device, g_vk_pipeline, NULL);
@@ -430,17 +489,13 @@ static void cleanup_vulkan_backend(void) {
     vkDestroyPipelineLayout(g_vk_device, g_vk_pipeline_layout, NULL);
     g_vk_pipeline_layout = VK_NULL_HANDLE;
   }
-  if (g_vk_descriptor_pool != VK_NULL_HANDLE) {
-    vkDestroyDescriptorPool(g_vk_device, g_vk_descriptor_pool, NULL);
-    g_vk_descriptor_pool = VK_NULL_HANDLE;
-  }
   if (g_vk_descriptor_set_layout != VK_NULL_HANDLE) {
     vkDestroyDescriptorSetLayout(g_vk_device, g_vk_descriptor_set_layout, NULL);
     g_vk_descriptor_set_layout = VK_NULL_HANDLE;
   }
-  if (g_vk_command_pool != VK_NULL_HANDLE) {
-    vkDestroyCommandPool(g_vk_device, g_vk_command_pool, NULL);
-    g_vk_command_pool = VK_NULL_HANDLE;
+  if (g_vk_descriptor_pool != VK_NULL_HANDLE) {
+    vkDestroyDescriptorPool(g_vk_device, g_vk_descriptor_pool, NULL);
+    g_vk_descriptor_pool = VK_NULL_HANDLE;
   }
   if (g_vk_device != VK_NULL_HANDLE) {
     vkDestroyDevice(g_vk_device, NULL);
@@ -692,113 +747,112 @@ static void init_gpu_backend(void) {
 #ifdef __OBJC__
   cleanup_gpu_backend();
   g_gpu_available = initialize_metal_backend();
+  set_gpu_status(g_gpu_available ? APXDB_GPU_METAL_ACTIVE : APXDB_GPU_INIT_FAILED);
 #else
   g_gpu_available = false;
+  set_gpu_status(APXDB_GPU_UNAVAILABLE);
 #endif
 #elif defined(__ANDROID__)
   cleanup_gpu_backend();
   g_gpu_available = initialize_vulkan_backend();
+  set_gpu_status(g_gpu_available ? APXDB_GPU_VULKAN_ACTIVE : APXDB_GPU_INIT_FAILED);
 #else
   g_gpu_available = false;
+  set_gpu_status(APXDB_GPU_UNAVAILABLE);
 #endif
 }
 
 int32_t apxdb_initialize() {
   pthread_mutex_lock(&g_mutex);
-  if (g_initialized) {
+  if (g_state == APXDB_STATE_OPEN) {
     pthread_mutex_unlock(&g_mutex);
-    return 0;
+    return APXDB_OK;
   }
+  if (g_state == APXDB_STATE_OPENING || g_state == APXDB_STATE_CLOSING || g_state == APXDB_STATE_FAILED) {
+    pthread_mutex_unlock(&g_mutex);
+    return APXDB_ERR_PARTIAL_RECOVERY;
+  }
+  set_state(APXDB_STATE_OPENING);
 
-  free_documents();
-  atomic_store(&g_document_counter, 0);
-  g_initialized = true;
-  init_gpu_backend();
+  int32_t result = initialize_internal();
+  set_state(APXDB_STATE_OPEN);
   pthread_mutex_unlock(&g_mutex);
-  return 0;
+  return result;
 }
 
 int32_t apxdb_shutdown() {
   pthread_mutex_lock(&g_mutex);
-  if (!g_initialized) {
+  if (g_state == APXDB_STATE_CLOSED) {
     pthread_mutex_unlock(&g_mutex);
-    return 0;
+    return APXDB_OK;
+  }
+  if (g_state == APXDB_STATE_OPENING || g_state == APXDB_STATE_CLOSING) {
+    pthread_mutex_unlock(&g_mutex);
+    return APXDB_ERR_PARTIAL_RECOVERY;
   }
 
-  cleanup_gpu_backend();
-  free_documents();
-  apxdb_collection_unregister_all();
-  apxdb_schema_unregister_all();
-  free(g_storage_directory);
-  g_storage_directory = NULL;
-  g_initialized = false;
+  transition_to_closed();
   pthread_mutex_unlock(&g_mutex);
-  return 0;
+  return APXDB_OK;
 }
 
 int32_t apxdb_open(const char* directory_path) {
   if (!directory_path) {
-    return -1;
+    return APXDB_ERR_INVALID_ARGUMENT;
   }
 
   pthread_mutex_lock(&g_mutex);
-  if (g_initialized) {
+  if (g_state == APXDB_STATE_OPEN) {
     pthread_mutex_unlock(&g_mutex);
-    return 0;
+    return APXDB_ERR_ALREADY_OPEN;
+  }
+  if (g_state == APXDB_STATE_OPENING || g_state == APXDB_STATE_CLOSING || g_state == APXDB_STATE_FAILED) {
+    pthread_mutex_unlock(&g_mutex);
+    return APXDB_ERR_PARTIAL_RECOVERY;
   }
 
-  if (!ensure_directory_exists(directory_path)) {
+  set_state(APXDB_STATE_OPENING);
+  if (!ensure_directory_exists_native(directory_path)) {
+    set_state(APXDB_STATE_FAILED);
     pthread_mutex_unlock(&g_mutex);
-    return -1;
+    return APXDB_ERR_IO;
   }
 
-  initialize_internal();
+  int32_t result = initialize_internal();
   if (!set_storage_directory(directory_path)) {
-    cleanup_gpu_backend();
-    g_initialized = false;
+    cleanup_partial_open();
+    set_state(APXDB_STATE_FAILED);
     pthread_mutex_unlock(&g_mutex);
-    return -1;
+    return APXDB_ERR_UNKNOWN;
   }
 
   // TODO: Week 2 - support persistent .idx index files and schema version checks.
   if (apxdb_load_all_collections(directory_path) != 0) {
-    cleanup_gpu_backend();
-    apxdb_collection_unregister_all();
-    apxdb_schema_unregister_all();
-    free(g_storage_directory);
-    g_storage_directory = NULL;
-    g_initialized = false;
+    cleanup_partial_open();
+    set_state(APXDB_STATE_FAILED);
     pthread_mutex_unlock(&g_mutex);
-    return -1;
+    return APXDB_ERR_IO;
   }
 
+  set_state(APXDB_STATE_OPEN);
   pthread_mutex_unlock(&g_mutex);
-  return 0;
+  return result;
 }
 
 int32_t apxdb_close(void) {
   pthread_mutex_lock(&g_mutex);
-  if (!g_initialized) {
+  if (g_state == APXDB_STATE_CLOSED) {
     pthread_mutex_unlock(&g_mutex);
-    return 0;
+    return APXDB_ERR_NOT_OPEN;
+  }
+  if (g_state == APXDB_STATE_OPENING || g_state == APXDB_STATE_CLOSING) {
+    pthread_mutex_unlock(&g_mutex);
+    return APXDB_ERR_PARTIAL_RECOVERY;
   }
 
-  int32_t result = 0;
-  if (g_storage_directory) {
-    if (apxdb_save_all_collections(g_storage_directory) != 0) {
-      result = -1;
-    }
-  }
-
-  cleanup_gpu_backend();
-  free_documents();
-  apxdb_collection_unregister_all();
-  apxdb_schema_unregister_all();
-  free(g_storage_directory);
-  g_storage_directory = NULL;
-  g_initialized = false;
+  transition_to_closed();
   pthread_mutex_unlock(&g_mutex);
-  return result;
+  return APXDB_OK;
 }
 
 static void cleanup_gpu_backend(void) {
@@ -812,6 +866,7 @@ static void cleanup_gpu_backend(void) {
   (void)0;
 #endif
   g_gpu_available = false;
+  set_gpu_status(APXDB_GPU_UNAVAILABLE);
 }
 
 const char* apxdb_create_document(const char* json_utf8) {
@@ -820,7 +875,7 @@ const char* apxdb_create_document(const char* json_utf8) {
   }
 
   pthread_mutex_lock(&g_mutex);
-  if (!g_initialized) {
+  if (g_state != APXDB_STATE_OPEN) {
     pthread_mutex_unlock(&g_mutex);
     return allocate_utf8_string("error:uninitialized");
   }
@@ -844,7 +899,7 @@ const char* apxdb_find_document(const char* query_utf8) {
   }
 
   pthread_mutex_lock(&g_mutex);
-  if (!g_initialized) {
+  if (g_state != APXDB_STATE_OPEN) {
     pthread_mutex_unlock(&g_mutex);
     return allocate_utf8_string("error:uninitialized");
   }

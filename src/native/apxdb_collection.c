@@ -1,3 +1,5 @@
+#include <pthread.h>
+#include "apxdb.h"
 #include "apxdb_collection.h"
 #include "apxdb_json.h"
 #include <stdlib.h>
@@ -59,6 +61,10 @@ static atomic_int_fast32_t g_collection_counter = ATOMIC_VAR_INIT(0);
 static apxdb_transaction_t* g_active_transaction = NULL;
 static const size_t kGpuQueryMinDocs = 128;
 static const uint32_t kCollectionFileMagic = 0x41505843u; // 'APXC'
+
+static pthread_mutex_t g_query_diagnostics_mutex = PTHREAD_MUTEX_INITIALIZER;
+static apxdb_query_path_t g_last_query_path = APXDB_QUERY_CPU_ONLY;
+static uint32_t g_last_query_doc_count = 0;
 static const uint32_t kCollectionFileVersion = 1;
 
 static bool grow_collections(void) {
@@ -1717,6 +1723,8 @@ static char* json_value_to_string(const apxdb_json_value_t* value) {
 static bool parse_numeric_value(const apxdb_json_value_t* value, double* out_value);
 static bool compare_numeric_operator(double doc_value, const char* op, double threshold);
 static const apxdb_json_value_t* json_path_get(const apxdb_json_value_t* root, const char* path);
+static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count);
+static bool is_gpu_runtime_available(void);
 
 static bool json_value_equal(const apxdb_json_value_t* a, const apxdb_json_value_t* b) {
   if (!a || !b || a->type != b->type) {
@@ -1778,11 +1786,23 @@ static char** scan_docs_for_member(apxdb_collection_t* collection, const apxdb_j
     int op_code;
     int32_t threshold;
     if (parse_numeric_query_op(member->value, &op_code, &threshold)) {
-      char** gpu_result = gpu_scan_numeric_docs(collection, member->name, query_field, op_code, threshold, out_count);
-      if (gpu_result) {
-        return gpu_result;
+      if (!is_gpu_runtime_available()) {
+        set_last_query_diagnostics(APXDB_QUERY_GPU_SKIPPED_BACKEND_UNAVAILABLE, (uint32_t)collection->document_count);
+      } else {
+        char** gpu_result = gpu_scan_numeric_docs(collection, member->name, query_field, op_code, threshold, out_count);
+        if (gpu_result) {
+          set_last_query_diagnostics(APXDB_QUERY_GPU_USED, (uint32_t)(*out_count));
+          return gpu_result;
+        }
+        set_last_query_diagnostics(APXDB_QUERY_GPU_SKIPPED_UNSUPPORTED_TYPE, (uint32_t)collection->document_count);
       }
+    } else {
+      set_last_query_diagnostics(APXDB_QUERY_CPU_ONLY, (uint32_t)collection->document_count);
     }
+  } else if (collection->document_count < kGpuQueryMinDocs) {
+    set_last_query_diagnostics(APXDB_QUERY_GPU_SKIPPED_THRESHOLD, (uint32_t)collection->document_count);
+  } else {
+    set_last_query_diagnostics(APXDB_QUERY_CPU_ONLY, (uint32_t)collection->document_count);
   }
 
   for (size_t i = 0; i < collection->document_count; ++i) {
@@ -2116,6 +2136,32 @@ static const apxdb_json_value_t* json_path_get(const apxdb_json_value_t* value, 
     segment = strtok(NULL, ".");
   }
   return current;
+}
+
+static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_path = path;
+  g_last_query_doc_count = count;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static bool is_gpu_runtime_available(void) {
+  int32_t status = apxdb_gpu_status();
+  return status == APXDB_GPU_METAL_ACTIVE || status == APXDB_GPU_VULKAN_ACTIVE;
+}
+
+int32_t apxdb_last_query_path(void) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  int32_t path = (int32_t)g_last_query_path;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+  return path;
+}
+
+uint32_t apxdb_last_query_doc_count(void) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  uint32_t count = g_last_query_doc_count;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+  return count;
 }
 
 static bool index_document(apxdb_collection_t* collection, size_t doc_index, const apxdb_json_value_t* document) {
@@ -2591,6 +2637,7 @@ const char* apxdb_put_document(const char* collection_name, const char* json_utf
     free(id);
     return NULL;
   }
+  collection->dirty = true;
 
   if (!index_document(collection, collection->document_count - 1, &doc_value)) {
     apxdb_json_free(&doc_value);
