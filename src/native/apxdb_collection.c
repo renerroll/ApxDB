@@ -135,6 +135,7 @@ static bool compute_field_payload_size(const apxdb_schema_field_t* field, const 
 static bool serialize_field_payload(const apxdb_schema_field_t* field, const apxdb_json_value_t* value, uint8_t* buffer, size_t buffer_size, size_t* out_written);
 static uint64_t compute_schema_signature(const apxdb_schema_t* schema);
 static bool validate_loaded_index_data(apxdb_collection_t* collection);
+static uint64_t now_ns(void);
 static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count);
 static void reset_last_query_metrics(void);
 static void update_last_query_metrics_path(apxdb_query_path_t path);
@@ -1534,6 +1535,9 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
     return NULL;
   }
 
+  bool using_cache = cache != NULL;
+  uint64_t cpu_prepare_start_ns = now_ns();
+
   if (!cache) {
     if (build_gpu_column_cache(collection, field_path, field)) {
       cache = find_gpu_column_cache(collection, field_path);
@@ -1579,8 +1583,21 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
     }
   }
 
-  bool using_cache = cache != NULL;
+  if (!using_cache) {
+    add_last_query_metrics_bytes_uploaded(count * (sizeof(int32_t) + sizeof(uint32_t)));
+  } else {
+    add_last_query_metrics_bytes_reused(count * (sizeof(int32_t) + sizeof(uint32_t)));
+  }
+  add_last_query_metrics_cpu_prepare_ns(now_ns() - cpu_prepare_start_ns);
+  if (using_cache) {
+    increment_last_query_metrics_cache_hit();
+  } else {
+    increment_last_query_metrics_cache_miss();
+  }
+
+  uint64_t gpu_start_ns = now_ns();
   if (!run_gpu_query_int(values, valid_mask, count, op_code, threshold, mask)) {
+    add_last_query_metrics_gpu_exec_ns(now_ns() - gpu_start_ns);
     if (!using_cache) {
       free(values);
       free(valid_mask);
@@ -1588,6 +1605,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
     free(mask);
     return NULL;
   }
+  add_last_query_metrics_gpu_exec_ns(now_ns() - gpu_start_ns);
 
   char** result = NULL;
   size_t result_capacity = 0;
@@ -1619,9 +1637,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
     free(valid_mask);
   }
   free(mask);
-  if (*out_count == 0) {
-    result = (char**)malloc(0);
-  }
+  set_last_query_metrics_result_count(*out_count);
   return result;
 }
 
@@ -2461,6 +2477,9 @@ static char** scan_docs_for_member(apxdb_collection_t* collection, const apxdb_j
     return NULL;
   }
 
+  reset_last_query_metrics();
+  uint64_t query_start_ns = now_ns();
+
   char** result = NULL;
   size_t result_capacity = 0;
   *out_count = 0;
@@ -2515,6 +2534,9 @@ static char** scan_docs_for_member(apxdb_collection_t* collection, const apxdb_j
   if (*out_count == 0) {
     result = (char**)malloc(0);
   }
+
+  set_last_query_metrics_result_count(*out_count);
+  set_last_query_metrics_total_ns(now_ns() - query_start_ns);
   return result;
 }
 
@@ -2909,8 +2931,12 @@ static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count) 
   g_last_query_path = path;
   g_last_query_doc_count = count;
   pthread_mutex_unlock(&g_query_diagnostics_mutex);
+  update_last_query_metrics_path(path);
 }
 #else
+static uint64_t now_ns(void) {
+  return 0;
+}
 static void reset_last_query_metrics(void) {
 }
 static void update_last_query_metrics_path(apxdb_query_path_t path) { (void)path; }
@@ -3194,6 +3220,9 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
     return NULL;
   }
 
+  reset_last_query_metrics();
+  update_last_query_metrics_path(APXDB_QUERY_CPU_ONLY);
+
   char** results = NULL;
   size_t result_count = 0;
   size_t result_capacity = 0;
@@ -3222,6 +3251,8 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
   }
 
   *out_count = result_count;
+  set_last_query_metrics_result_count(result_count);
+  set_last_query_metrics_total_ns(0);
   return results;
 }
 
@@ -3248,7 +3279,11 @@ static char** find_docs_for_member(apxdb_collection_t* collection, const apxdb_j
         apxdb_index_entry_t* entry = find_index_entry(index, key);
         free(key);
         if (entry) {
+          reset_last_query_metrics();
+          update_last_query_metrics_path(APXDB_QUERY_CPU_ONLY);
           *out_count = entry->doc_count;
+          set_last_query_metrics_result_count(*out_count);
+          set_last_query_metrics_total_ns(0);
           return copy_doc_id_list(entry->doc_ids, entry->doc_count);
         }
       }
@@ -3378,6 +3413,10 @@ const char* apxdb_find_documents(const char* collection_name, const char* query_
   if (!collection || !ensure_collection_loaded(collection, NULL)) {
     return NULL;
   }
+
+  reset_last_query_metrics();
+  uint64_t query_start_ns = now_ns();
+
   if (query_json && *query_json) {
     apxdb_json_value_t query;
     if (apxdb_json_parse(query_json, &query)) {
@@ -3390,11 +3429,20 @@ const char* apxdb_find_documents(const char* collection_name, const char* query_
         if (owned && doc_ids) {
           free(doc_ids);
         }
+        set_last_query_metrics_result_count(doc_count);
+        set_last_query_metrics_total_ns(now_ns() - query_start_ns);
         return result;
       }
     }
   }
-  return build_documents_array(collection, query_json);
+
+  const char* fallback = build_documents_array(collection, query_json);
+  if (fallback) {
+    // No filtering query path; still record that the call completed.
+    set_last_query_metrics_result_count(collection->document_count);
+    set_last_query_metrics_total_ns(now_ns() - query_start_ns);
+  }
+  return fallback;
 }
 
 const char* apxdb_put_document(const char* collection_name, const char* json_utf8) {
