@@ -826,7 +826,7 @@ int32_t apxdb_open(const char* directory_path) {
     return APXDB_ERR_UNKNOWN;
   }
 
-  // TODO: Week 2 - support persistent .idx index files and schema version checks.
+  // Load collection data and persistent index metadata if available.
   if (apxdb_load_all_collections(directory_path) != 0) {
     cleanup_partial_open();
     set_state(APXDB_STATE_FAILED);

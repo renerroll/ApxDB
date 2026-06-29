@@ -62,9 +62,11 @@ static apxdb_transaction_t* g_active_transaction = NULL;
 static const size_t kGpuQueryMinDocs = 128;
 static const uint32_t kCollectionFileMagic = 0x41505843u; // 'APXC'
 
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
 static pthread_mutex_t g_query_diagnostics_mutex = PTHREAD_MUTEX_INITIALIZER;
 static apxdb_query_path_t g_last_query_path = APXDB_QUERY_CPU_ONLY;
 static uint32_t g_last_query_doc_count = 0;
+#endif
 static const uint32_t kCollectionFileVersion = 1;
 
 static bool grow_collections(void) {
@@ -118,16 +120,25 @@ static bool serialize_document_blob(const apxdb_schema_t* schema, const apxdb_js
 static bool compute_document_blob_size(const apxdb_schema_t* schema, const apxdb_json_value_t* document, size_t* out_size);
 static bool compute_field_payload_size(const apxdb_schema_field_t* field, const apxdb_json_value_t* value, size_t* out_size);
 static bool serialize_field_payload(const apxdb_schema_field_t* field, const apxdb_json_value_t* value, uint8_t* buffer, size_t buffer_size, size_t* out_written);
+static uint64_t compute_schema_signature(const apxdb_schema_t* schema);
+static bool validate_loaded_index_data(apxdb_collection_t* collection);
+static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count);
 extern bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t count, int op, int32_t threshold, uint8_t* out_mask);
 static bool index_document(apxdb_collection_t* collection, size_t doc_index, const apxdb_json_value_t* document);
 static bool ensure_directory_exists(const char* path);
+static apxdb_collection_document_t* find_document_by_id(apxdb_collection_t* collection, const char* id);
 static bool format_collection_file_path(const char* directory_path, const char* collection_name, char* out_path, size_t out_path_size);
+static bool format_index_file_path(const char* directory_path, const char* collection_name, char* out_path, size_t out_path_size);
 static bool save_collection_to_file(apxdb_collection_t* collection, const char* file_path);
+static bool save_collection_index_file(apxdb_collection_t* collection, const char* file_path);
 static bool load_collection_from_file(apxdb_collection_t* collection, const char* file_path);
+static bool load_collection_index_file(apxdb_collection_t* collection, const char* file_path);
 static bool write_uint32_to_file(FILE* file, uint32_t value);
 static bool write_uint64_to_file(FILE* file, uint64_t value);
+static bool write_uint8_to_file(FILE* file, uint8_t value);
 static bool read_uint32_from_file(FILE* file, uint32_t* out_value);
 static bool read_uint64_from_file(FILE* file, uint64_t* out_value);
+static bool read_uint8_from_file(FILE* file, uint8_t* out_value);
 static bool write_bytes_to_file(FILE* file, const void* buffer, size_t size);
 static bool read_bytes_from_file(FILE* file, void* buffer, size_t size);
 static void update_document_counter_from_id(const char* id);
@@ -1023,6 +1034,64 @@ static void free_index_data(apxdb_index_data_t* index) {
   free(index->entries);
 }
 
+static uint64_t compute_schema_signature(const apxdb_schema_t* schema) {
+  if (!schema) {
+    return 0;
+  }
+  uint64_t hash = 1469598103934665603ull;
+  for (size_t i = 0; i < schema->field_count; ++i) {
+    const apxdb_schema_field_t* field = &schema->fields[i];
+    const char* name = field->name ? field->name : "";
+    for (const char* p = name; *p; ++p) {
+      hash ^= (uint64_t)(uint8_t)*p;
+      hash *= 1099511628211ull;
+    }
+    hash ^= (uint64_t)field->type;
+    hash *= 1099511628211ull;
+    hash ^= (uint64_t)field->nullable;
+    hash *= 1099511628211ull;
+  }
+  hash ^= (uint64_t)schema->field_count;
+  hash *= 1099511628211ull;
+  return hash;
+}
+
+static void clear_loaded_index_data(apxdb_collection_t* collection, size_t loaded_count) {
+  if (!collection) {
+    return;
+  }
+  for (size_t i = 0; i < loaded_count && i < collection->index_data_count; ++i) {
+    free_index_data(&collection->index_data[i]);
+    collection->index_data[i].entries = NULL;
+    collection->index_data[i].entry_count = 0;
+    collection->index_data[i].entry_capacity = 0;
+  }
+}
+
+static bool validate_loaded_index_data(apxdb_collection_t* collection) {
+  if (!collection) {
+    return false;
+  }
+  for (size_t i = 0; i < collection->index_count; ++i) {
+    apxdb_index_data_t* index = &collection->index_data[i];
+    for (size_t j = 0; j < index->entry_count; ++j) {
+      apxdb_index_entry_t* entry = &index->entries[j];
+      if (!entry->key) {
+        return false;
+      }
+      if (entry->doc_count > collection->document_count) {
+        return false;
+      }
+      for (size_t k = 0; k < entry->doc_count; ++k) {
+        if (!entry->doc_ids[k] || !find_document_by_id(collection, entry->doc_ids[k])) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 static void free_collection(apxdb_collection_t* collection) {
   if (!collection) {
     return;
@@ -1461,6 +1530,14 @@ static bool format_collection_file_path(const char* directory_path, const char* 
   return written >= 0 && (size_t)written < out_path_size;
 }
 
+static bool format_index_file_path(const char* directory_path, const char* collection_name, char* out_path, size_t out_path_size) {
+  if (!directory_path || !collection_name || !out_path || out_path_size == 0) {
+    return false;
+  }
+  int written = snprintf(out_path, out_path_size, "%s/%s.idx", directory_path, collection_name);
+  return written >= 0 && (size_t)written < out_path_size;
+}
+
 int32_t apxdb_save_all_collections(const char* directory_path) {
   if (!directory_path) {
     return -1;
@@ -1563,6 +1640,328 @@ static bool save_collection_to_file(apxdb_collection_t* collection, const char* 
     remove(temp_path);
     return false;
   }
+
+  char index_path[1024];
+  if (collection->index_count > 0) {
+    const char* separator = strrchr(file_path, '/');
+#ifdef _WIN32
+    const char* separator_win = strrchr(file_path, '\\');
+    if (!separator || (separator_win && separator_win > separator)) {
+      separator = separator_win;
+    }
+#endif
+    char directory_path[1024];
+    if (separator) {
+      size_t length = (size_t)(separator - file_path);
+      if (length >= sizeof(directory_path)) {
+        return false;
+      }
+      memcpy(directory_path, file_path, length);
+      directory_path[length] = '\0';
+    } else {
+      directory_path[0] = '.';
+      directory_path[1] = '\0';
+    }
+    if (format_index_file_path(directory_path, collection->schema->collection_name, index_path, sizeof(index_path))) {
+      if (!save_collection_index_file(collection, index_path)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static bool write_uint8_to_file(FILE* file, uint8_t value) {
+  return fwrite(&value, 1, sizeof(value), file) == sizeof(value);
+}
+
+static bool read_uint8_from_file(FILE* file, uint8_t* out_value) {
+  if (!out_value) {
+    return false;
+  }
+  return fread(out_value, 1, sizeof(*out_value), file) == sizeof(*out_value);
+}
+
+static bool save_collection_index_file(apxdb_collection_t* collection, const char* file_path) {
+  if (!collection || !file_path) {
+    return false;
+  }
+  char temp_path[1024];
+  int written = snprintf(temp_path, sizeof(temp_path), "%s.tmp", file_path);
+  if (written < 0 || (size_t)written >= sizeof(temp_path)) {
+    return false;
+  }
+  FILE* file = fopen(temp_path, "wb");
+  if (!file) {
+    return false;
+  }
+
+  const char magic[] = "APXDBIDX";
+  if (!write_bytes_to_file(file, magic, sizeof(magic) - 1)) {
+    fclose(file);
+    return false;
+  }
+  if (!write_uint32_to_file(file, 1)) {
+    fclose(file);
+    return false;
+  }
+
+  uint64_t schema_signature = compute_schema_signature(collection->schema);
+  if (!write_uint64_to_file(file, schema_signature)) {
+    fclose(file);
+    return false;
+  }
+
+  uint32_t name_length = (uint32_t)strlen(collection->schema->collection_name);
+  if (!write_uint32_to_file(file, name_length) || !write_bytes_to_file(file, collection->schema->collection_name, name_length)) {
+    fclose(file);
+    return false;
+  }
+
+  if (!write_uint32_to_file(file, (uint32_t)collection->index_count)) {
+    fclose(file);
+    return false;
+  }
+
+  for (size_t i = 0; i < collection->index_count; ++i) {
+    const apxdb_index_definition_t* def = &collection->indexes[i];
+    uint32_t field_length = (uint32_t)strlen(def->field_name);
+    if (!write_uint32_to_file(file, field_length) || !write_bytes_to_file(file, def->field_name, field_length) ||
+        !write_uint32_to_file(file, (uint32_t)def->index_type) || !write_uint8_to_file(file, def->composite ? 1 : 0) ||
+        !write_uint8_to_file(file, def->multi_entry ? 1 : 0) || !write_uint8_to_file(file, 0) || !write_uint8_to_file(file, 0)) {
+      fclose(file);
+      remove(temp_path);
+      return false;
+    }
+  }
+
+  for (size_t i = 0; i < collection->index_count; ++i) {
+    apxdb_index_data_t* index = &collection->index_data[i];
+    if (!write_uint32_to_file(file, (uint32_t)index->entry_count)) {
+      fclose(file);
+      remove(temp_path);
+      return false;
+    }
+    for (size_t j = 0; j < index->entry_count; ++j) {
+      apxdb_index_entry_t* entry = &index->entries[j];
+      uint32_t key_length = (uint32_t)strlen(entry->key);
+      if (!write_uint32_to_file(file, key_length) || !write_bytes_to_file(file, entry->key, key_length) ||
+          !write_uint32_to_file(file, (uint32_t)entry->doc_count)) {
+        fclose(file);
+        remove(temp_path);
+        return false;
+      }
+      for (size_t k = 0; k < entry->doc_count; ++k) {
+        uint32_t doc_id_length = (uint32_t)strlen(entry->doc_ids[k]);
+        if (!write_uint32_to_file(file, doc_id_length) || !write_bytes_to_file(file, entry->doc_ids[k], doc_id_length)) {
+          fclose(file);
+          remove(temp_path);
+          return false;
+        }
+      }
+    }
+  }
+
+  fclose(file);
+  if (rename(temp_path, file_path) != 0) {
+    remove(temp_path);
+    return false;
+  }
+  return true;
+}
+
+static bool load_collection_index_file(apxdb_collection_t* collection, const char* file_path) {
+  if (!collection || !file_path) {
+    return false;
+  }
+  FILE* file = fopen(file_path, "rb");
+  if (!file) {
+    return false;
+  }
+
+  char magic[9];
+  if (!read_bytes_from_file(file, magic, sizeof(magic) - 1)) {
+    fclose(file);
+    return false;
+  }
+  magic[sizeof(magic) - 1] = '\0';
+  if (strcmp(magic, "APXDBIDX") != 0) {
+    fclose(file);
+    return false;
+  }
+
+  uint32_t version;
+  if (!read_uint32_from_file(file, &version) || version != 1) {
+    fclose(file);
+    return false;
+  }
+
+  uint32_t name_length;
+  if (!read_uint32_from_file(file, &name_length) || name_length == 0) {
+    fclose(file);
+    return false;
+  }
+  char* name_buffer = (char*)malloc(name_length + 1);
+  if (!name_buffer || !read_bytes_from_file(file, name_buffer, name_length)) {
+    free(name_buffer);
+    fclose(file);
+    return false;
+  }
+  name_buffer[name_length] = '\0';
+  bool matched_name = strcmp(name_buffer, collection->schema->collection_name) == 0;
+  free(name_buffer);
+  if (!matched_name) {
+    fclose(file);
+    return false;
+  }
+
+  uint64_t stored_schema_signature;
+  if (!read_uint64_from_file(file, &stored_schema_signature) || stored_schema_signature != compute_schema_signature(collection->schema)) {
+    fclose(file);
+    return false;
+  }
+
+  uint32_t saved_index_count;
+  if (!read_uint32_from_file(file, &saved_index_count) || saved_index_count != collection->index_count) {
+    fclose(file);
+    return false;
+  }
+
+  size_t loaded_index_count = 0;
+  for (size_t i = 0; i < collection->index_count; ++i) {
+    uint32_t field_length;
+    if (!read_uint32_from_file(file, &field_length) || field_length == 0) {
+      fclose(file);
+      return false;
+    }
+    char* field_buffer = (char*)malloc(field_length + 1);
+    if (!field_buffer || !read_bytes_from_file(file, field_buffer, field_length)) {
+      free(field_buffer);
+      fclose(file);
+      return false;
+    }
+    field_buffer[field_length] = '\0';
+
+    uint32_t saved_index_type;
+    uint8_t saved_composite;
+    uint8_t saved_multi_entry;
+    uint8_t reserved1;
+    uint8_t reserved2;
+    if (!read_uint32_from_file(file, &saved_index_type) || !read_uint8_from_file(file, &saved_composite) ||
+        !read_uint8_from_file(file, &saved_multi_entry) || !read_uint8_from_file(file, &reserved1) ||
+        !read_uint8_from_file(file, &reserved2)) {
+      free(field_buffer);
+      fclose(file);
+      clear_loaded_index_data(collection, loaded_index_count);
+      return false;
+    }
+
+    const apxdb_index_definition_t* def = &collection->indexes[i];
+    bool mismatch = strcmp(def->field_name, field_buffer) != 0 || def->index_type != (apxdb_index_type_t)saved_index_type ||
+                    def->composite != (saved_composite != 0) || def->multi_entry != (saved_multi_entry != 0);
+    free(field_buffer);
+    if (mismatch) {
+      fclose(file);
+      clear_loaded_index_data(collection, loaded_index_count);
+      return false;
+    }
+  }
+
+  for (size_t i = 0; i < collection->index_count; ++i) {
+    apxdb_index_data_t* index = &collection->index_data[i];
+    uint32_t entry_count;
+    if (!read_uint32_from_file(file, &entry_count)) {
+      fclose(file);
+      clear_loaded_index_data(collection, loaded_index_count);
+      return false;
+    }
+    if (entry_count > collection->document_count) {
+      fclose(file);
+      clear_loaded_index_data(collection, loaded_index_count);
+      return false;
+    }
+    if (entry_count > 0) {
+      index->entries = (apxdb_index_entry_t*)malloc(entry_count * sizeof(apxdb_index_entry_t));
+      if (!index->entries) {
+        fclose(file);
+        clear_loaded_index_data(collection, loaded_index_count);
+        return false;
+      }
+      memset(index->entries, 0, entry_count * sizeof(apxdb_index_entry_t));
+      index->entry_capacity = entry_count;
+      index->entry_count = entry_count;
+    } else {
+      index->entries = NULL;
+      index->entry_capacity = 0;
+      index->entry_count = 0;
+    }
+
+    for (uint32_t j = 0; j < entry_count; ++j) {
+      uint32_t key_length;
+      if (!read_uint32_from_file(file, &key_length) || key_length == 0) {
+        free_index_data(index);
+        clear_loaded_index_data(collection, loaded_index_count);
+        fclose(file);
+        return false;
+      }
+      index->entries[j].key = (char*)malloc(key_length + 1);
+      if (!index->entries[j].key || !read_bytes_from_file(file, index->entries[j].key, key_length)) {
+        free_index_data(index);
+        clear_loaded_index_data(collection, loaded_index_count);
+        fclose(file);
+        return false;
+      }
+      index->entries[j].key[key_length] = '\0';
+
+      uint32_t doc_count;
+      if (!read_uint32_from_file(file, &doc_count)) {
+        free_index_data(index);
+        clear_loaded_index_data(collection, loaded_index_count);
+        fclose(file);
+        return false;
+      }
+      if (doc_count > collection->document_count) {
+        free_index_data(index);
+        clear_loaded_index_data(collection, loaded_index_count);
+        fclose(file);
+        return false;
+      }
+      index->entries[j].doc_ids = (char**)malloc(doc_count * sizeof(char*));
+      if (!index->entries[j].doc_ids) {
+        free_index_data(index);
+        clear_loaded_index_data(collection, loaded_index_count);
+        fclose(file);
+        return false;
+      }
+      index->entries[j].doc_count = doc_count;
+      index->entries[j].doc_capacity = doc_count;
+
+      for (uint32_t k = 0; k < doc_count; ++k) {
+        uint32_t doc_id_length;
+        if (!read_uint32_from_file(file, &doc_id_length) || doc_id_length == 0) {
+          fclose(file);
+          return false;
+        }
+        index->entries[j].doc_ids[k] = (char*)malloc(doc_id_length + 1);
+        if (!index->entries[j].doc_ids[k] || !read_bytes_from_file(file, index->entries[j].doc_ids[k], doc_id_length)) {
+          free_index_data(index);
+          clear_loaded_index_data(collection, loaded_index_count);
+          fclose(file);
+          return false;
+        }
+        index->entries[j].doc_ids[k][doc_id_length] = '\0';
+      }
+    }
+    loaded_index_count = i + 1;
+  }
+
+  if (!validate_loaded_index_data(collection)) {
+    clear_loaded_index_data(collection, loaded_index_count);
+    fclose(file);
+    return false;
+  }
+
+  fclose(file);
   return true;
 }
 
@@ -1575,19 +1974,27 @@ static bool load_collection_from_file(apxdb_collection_t* collection, const char
     return false;
   }
 
-  char magic[8];
+  char magic[9];
   if (!read_bytes_from_file(file, magic, sizeof(magic) - 1)) {
+    fprintf(stderr, "load_collection_from_file: failed to read magic from %s\n", file_path);
     fclose(file);
     return false;
   }
   magic[sizeof(magic) - 1] = '\0';
   if (strcmp(magic, "APXDBCLT") != 0) {
+    fprintf(stderr, "load_collection_from_file: bad magic for %s\n", file_path);
     fclose(file);
     return false;
   }
 
   uint32_t version;
-  if (!read_uint32_from_file(file, &version) || version != 1) {
+  if (!read_uint32_from_file(file, &version)) {
+    fprintf(stderr, "load_collection_from_file: could not read version from %s\n", file_path);
+    fclose(file);
+    return false;
+  }
+  if (version != 1) {
+    fprintf(stderr, "load_collection_from_file: unsupported version %u in %s\n", version, file_path);
     fclose(file);
     return false;
   }
@@ -1673,21 +2080,58 @@ static bool load_collection_from_file(apxdb_collection_t* collection, const char
       return false;
     }
     update_document_counter_from_id(id);
-
-    apxdb_json_value_t doc_value;
-    if (!apxdb_json_parse(json, &doc_value)) {
-      fclose(file);
-      return false;
-    }
-    if (!index_document(collection, collection->document_count - 1, &doc_value)) {
-      apxdb_json_free(&doc_value);
-      fclose(file);
-      return false;
-    }
-    apxdb_json_free(&doc_value);
-
     free(id);
     free(json);
+  }
+
+  bool index_loaded = false;
+  char index_path[1024];
+  if (collection->index_count > 0) {
+    const char* separator = strrchr(file_path, '/');
+#ifdef _WIN32
+    const char* separator_win = strrchr(file_path, '\\');
+    if (!separator || (separator_win && separator_win > separator)) {
+      separator = separator_win;
+    }
+#endif
+    char directory_path[1024];
+    if (separator) {
+      size_t length = (size_t)(separator - file_path);
+      if (length >= sizeof(directory_path)) {
+        fclose(file);
+        return false;
+      }
+      memcpy(directory_path, file_path, length);
+      directory_path[length] = '\0';
+    } else {
+      directory_path[0] = '.';
+      directory_path[1] = '\0';
+    }
+    if (format_index_file_path(directory_path, collection->schema->collection_name, index_path, sizeof(index_path))) {
+      struct stat idx_stat;
+      if (stat(index_path, &idx_stat) == 0) {
+        index_loaded = load_collection_index_file(collection, index_path);
+      }
+    }
+  }
+
+  if (!index_loaded && collection->index_count > 0) {
+    for (size_t i = 0; i < collection->document_count; ++i) {
+      apxdb_json_value_t doc_value;
+      if (!apxdb_json_parse(collection->documents[i].json, &doc_value)) {
+        fclose(file);
+        return false;
+      }
+      if (!index_document(collection, i, &doc_value)) {
+        apxdb_json_free(&doc_value);
+        fclose(file);
+        return false;
+      }
+      apxdb_json_free(&doc_value);
+    }
+    if (index_path[0] != '\0') {
+      save_collection_index_file(collection, index_path);
+    }
   }
 
   fclose(file);
@@ -2138,12 +2582,19 @@ static const apxdb_json_value_t* json_path_get(const apxdb_json_value_t* value, 
   return current;
 }
 
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
 static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count) {
   pthread_mutex_lock(&g_query_diagnostics_mutex);
   g_last_query_path = path;
   g_last_query_doc_count = count;
   pthread_mutex_unlock(&g_query_diagnostics_mutex);
 }
+#else
+static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count) {
+  (void)path;
+  (void)count;
+}
+#endif
 
 static bool is_gpu_runtime_available(void) {
   int32_t status = apxdb_gpu_status();
@@ -2151,17 +2602,25 @@ static bool is_gpu_runtime_available(void) {
 }
 
 int32_t apxdb_last_query_path(void) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
   pthread_mutex_lock(&g_query_diagnostics_mutex);
   int32_t path = (int32_t)g_last_query_path;
   pthread_mutex_unlock(&g_query_diagnostics_mutex);
   return path;
+#else
+  return APXDB_QUERY_CPU_ONLY;
+#endif
 }
 
 uint32_t apxdb_last_query_doc_count(void) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
   pthread_mutex_lock(&g_query_diagnostics_mutex);
   uint32_t count = g_last_query_doc_count;
   pthread_mutex_unlock(&g_query_diagnostics_mutex);
   return count;
+#else
+  return 0;
+#endif
 }
 
 static bool index_document(apxdb_collection_t* collection, size_t doc_index, const apxdb_json_value_t* document) {

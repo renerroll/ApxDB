@@ -25,6 +25,14 @@ typedef enum {
   APXDB_GPU_INIT_FAILED,
 } apxdb_gpu_status_t;
 
+// Debug-only diagnostics API. These helpers expose global runtime state
+// for the last observed query, and are not guaranteed to be correct under
+// concurrent query execution, in isolates, or in multithreaded scenarios.
+//
+// In production or future versions, prefer per-query metadata instead of
+// shared last-query globals.
+// Define APXDB_ENABLE_DIAGNOSTICS to enable runtime recording of this state.
+
 typedef enum {
   APXDB_QUERY_CPU_ONLY = 0,
   APXDB_QUERY_GPU_USED,
@@ -50,6 +58,9 @@ int32_t apxdb_shutdown();
 int32_t apxdb_open(const char* directory_path);
 int32_t apxdb_close(void);
 int32_t apxdb_gpu_status(void);
+
+// Debug-only helpers. Use for single-threaded diagnostics and benchmark
+// harnesses only. These values are global and are not thread-safe.
 int32_t apxdb_last_query_path(void);
 uint32_t apxdb_last_query_doc_count(void);
 const char* apxdb_create_document(const char* json_utf8);

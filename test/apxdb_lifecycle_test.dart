@@ -23,6 +23,8 @@ void main() {
         return ApxDbError.ok;
       },
       gpuStatus: () => ApxDbGpuStatus.vulkanActive,
+      lastQueryPath: () => ApxDbQueryPath.cpuOnly,
+      lastQueryDocCount: () => 0,
       createDocument: (Pointer<Utf8> json) => nullptr,
       findDocument: (Pointer<Utf8> query) => nullptr,
       releaseString: (Pointer<Utf8> value) {},
@@ -41,6 +43,11 @@ void main() {
     expect(ApxDB.close(), equals(ApxDbError.ok));
   });
 
+  test('query diagnostics bindings return default values', () {
+    expect(ApxDB.lastQueryPath(), equals(ApxDbQueryPath.cpuOnly));
+    expect(ApxDB.lastQueryDocCount(), equals(0));
+  });
+
   test('double close returns notOpen after first close', () {
     expect(ApxDB.open('test-dir'), equals(ApxDbError.ok));
     expect(ApxDB.close(), equals(ApxDbError.ok));
@@ -52,6 +59,8 @@ void main() {
       open: (Pointer<Utf8> path) => ApxDbError.invalidArgument,
       close: () => ApxDbError.notOpen,
       gpuStatus: () => ApxDbGpuStatus.unavailable,
+      lastQueryPath: () => ApxDbQueryPath.cpuOnly,
+      lastQueryDocCount: () => 0,
       createDocument: (Pointer<Utf8> json) => nullptr,
       findDocument: (Pointer<Utf8> query) => nullptr,
       releaseString: (Pointer<Utf8> value) {},
@@ -76,6 +85,8 @@ void main() {
       open: (Pointer<Utf8> path) => ApxDbError.ok,
       close: () => ApxDbError.ok,
       gpuStatus: () => ApxDbGpuStatus.unavailable,
+      lastQueryPath: () => ApxDbQueryPath.cpuOnly,
+      lastQueryDocCount: () => 0,
       createDocument: (Pointer<Utf8> json) => nullptr,
       findDocument: (Pointer<Utf8> query) => nullptr,
       releaseString: (Pointer<Utf8> value) {},

@@ -104,7 +104,19 @@ class ApxDB {
   }
 
   static int gpuStatus() => _bindings.gpuStatus();
+
+  /// Debug-only diagnostics helper.
+  ///
+  /// Returns global runtime state for the last observed native query.
+  /// This is not guaranteed to be correct for concurrent or isolate-shared
+  /// execution and should be used only for debug/benchmarking.
   static int lastQueryPath() => _bindings.lastQueryPath();
+
+  /// Debug-only diagnostics helper.
+  ///
+  /// Returns the document count observed for the last native query.
+  /// This is not guaranteed to be correct for concurrent or isolate-shared
+  /// execution and should be used only for debug/benchmarking.
   static int lastQueryDocCount() => _bindings.lastQueryDocCount();
 
   static String createDocument(String json) {
@@ -146,6 +158,9 @@ class ApxDbGpuStatus {
   static const int initFailed = 4;
 }
 
+/// Debug-only query diagnostics values returned by [ApxDB.lastQueryPath].
+/// These are a convenience API and are not thread-safe in the current
+/// runtime implementation.
 class ApxDbQueryPath {
   static const int cpuOnly = 0;
   static const int gpuUsed = 1;
