@@ -9,6 +9,9 @@
 #include <ctype.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <time.h>
+
+extern char* g_storage_directory;
 
 typedef struct {
   char* id;
@@ -31,6 +34,12 @@ typedef struct {
   size_t entry_capacity;
 } apxdb_index_data_t;
 
+typedef struct {
+  char* field_path;
+  int32_t* values;
+  uint32_t* valid_mask;
+} apxdb_gpu_column_cache_t;
+
 struct apxdb_collection_t {
   const apxdb_schema_t* schema;
   apxdb_collection_document_t* documents;
@@ -42,7 +51,11 @@ struct apxdb_collection_t {
   apxdb_index_data_t* index_data;
   size_t index_data_count;
   size_t index_data_capacity;
+  apxdb_gpu_column_cache_t* gpu_column_caches;
+  size_t gpu_column_cache_count;
+  size_t gpu_column_cache_capacity;
   bool dirty;
+  bool loaded;
 };
 
 struct apxdb_query_t {
@@ -67,7 +80,7 @@ static pthread_mutex_t g_query_diagnostics_mutex = PTHREAD_MUTEX_INITIALIZER;
 static apxdb_query_path_t g_last_query_path = APXDB_QUERY_CPU_ONLY;
 static uint32_t g_last_query_doc_count = 0;
 #endif
-static const uint32_t kCollectionFileVersion = 1;
+static const uint32_t kCollectionFileVersion = 2;
 
 static bool grow_collections(void) {
   if (g_collection_count >= g_collection_capacity) {
@@ -123,6 +136,17 @@ static bool serialize_field_payload(const apxdb_schema_field_t* field, const apx
 static uint64_t compute_schema_signature(const apxdb_schema_t* schema);
 static bool validate_loaded_index_data(apxdb_collection_t* collection);
 static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count);
+static void reset_last_query_metrics(void);
+static void update_last_query_metrics_path(apxdb_query_path_t path);
+static void set_last_query_metrics_result_count(uint64_t count);
+static void add_last_query_metrics_bytes_uploaded(uint64_t bytes);
+static void add_last_query_metrics_bytes_reused(uint64_t bytes);
+static void add_last_query_metrics_cpu_prepare_ns(uint64_t ns);
+static void add_last_query_metrics_gpu_exec_ns(uint64_t ns);
+static void set_last_query_metrics_total_ns(uint64_t ns);
+static void increment_last_query_metrics_cache_hit(void);
+static void increment_last_query_metrics_cache_miss(void);
+int32_t apxdb_last_query_metrics(apxdb_query_metrics_t* out_metrics);
 extern bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t count, int op, int32_t threshold, uint8_t* out_mask);
 static bool index_document(apxdb_collection_t* collection, size_t doc_index, const apxdb_json_value_t* document);
 static bool ensure_directory_exists(const char* path);
@@ -967,6 +991,113 @@ static bool ensure_index_data_capacity(apxdb_collection_t* collection) {
   return true;
 }
 
+static bool ensure_gpu_column_cache_capacity(apxdb_collection_t* collection) {
+  if (collection->gpu_column_cache_count >= collection->gpu_column_cache_capacity) {
+    size_t next_capacity = collection->gpu_column_cache_capacity == 0 ? 4 : collection->gpu_column_cache_capacity * 2;
+    apxdb_gpu_column_cache_t* next = (apxdb_gpu_column_cache_t*)realloc(collection->gpu_column_caches, next_capacity * sizeof(apxdb_gpu_column_cache_t));
+    if (!next) {
+      return false;
+    }
+    collection->gpu_column_caches = next;
+    collection->gpu_column_cache_capacity = next_capacity;
+  }
+  return true;
+}
+
+static apxdb_gpu_column_cache_t* find_gpu_column_cache(apxdb_collection_t* collection, const char* field_path) {
+  if (!collection || !field_path) {
+    return NULL;
+  }
+  for (size_t i = 0; i < collection->gpu_column_cache_count; ++i) {
+    if (strcmp(collection->gpu_column_caches[i].field_path, field_path) == 0) {
+      return &collection->gpu_column_caches[i];
+    }
+  }
+  return NULL;
+}
+
+static void free_gpu_column_cache(apxdb_gpu_column_cache_t* cache) {
+  if (!cache) {
+    return;
+  }
+  free(cache->field_path);
+  free(cache->values);
+  free(cache->valid_mask);
+  cache->field_path = NULL;
+  cache->values = NULL;
+  cache->valid_mask = NULL;
+}
+
+static void clear_gpu_column_caches(apxdb_collection_t* collection) {
+  if (!collection || !collection->gpu_column_caches) {
+    return;
+  }
+  for (size_t i = 0; i < collection->gpu_column_cache_count; ++i) {
+    free_gpu_column_cache(&collection->gpu_column_caches[i]);
+  }
+  free(collection->gpu_column_caches);
+  collection->gpu_column_caches = NULL;
+  collection->gpu_column_cache_count = 0;
+  collection->gpu_column_cache_capacity = 0;
+}
+
+static void invalidate_gpu_column_caches(apxdb_collection_t* collection) {
+  clear_gpu_column_caches(collection);
+}
+
+static bool build_gpu_column_cache(apxdb_collection_t* collection, const char* field_path, const apxdb_schema_field_t* field) {
+  if (!collection || !field_path || !field) {
+    return false;
+  }
+  if (find_gpu_column_cache(collection, field_path)) {
+    return true;
+  }
+  if (!ensure_gpu_column_cache_capacity(collection)) {
+    return false;
+  }
+
+  apxdb_gpu_column_cache_t* cache = &collection->gpu_column_caches[collection->gpu_column_cache_count];
+  cache->field_path = allocate_string_copy(field_path);
+  if (!cache->field_path) {
+    return false;
+  }
+  cache->values = (int32_t*)malloc(collection->document_count * sizeof(int32_t));
+  cache->valid_mask = (uint32_t*)malloc(collection->document_count * sizeof(uint32_t));
+  if (!cache->values || !cache->valid_mask) {
+    free(cache->field_path);
+    cache->field_path = NULL;
+    free(cache->values);
+    free(cache->valid_mask);
+    cache->values = NULL;
+    cache->valid_mask = NULL;
+    return false;
+  }
+
+  for (size_t i = 0; i < collection->document_count; ++i) {
+    const apxdb_schema_field_t* payload_field = NULL;
+    const uint8_t* payload = NULL;
+    size_t payload_size = 0;
+    if (!get_blob_field_payload(collection->schema, collection->documents[i].blob, collection->documents[i].blob_size, field_path, &payload_field, &payload, &payload_size) ||
+        !payload_field || payload_field->type != APXDB_TYPE_INT || payload_size < sizeof(int64_t)) {
+      cache->valid_mask[i] = 0;
+      cache->values[i] = 0;
+      continue;
+    }
+    int64_t raw;
+    memcpy(&raw, payload, sizeof(raw));
+    if (raw < INT32_MIN || raw > INT32_MAX) {
+      cache->valid_mask[i] = 0;
+      cache->values[i] = 0;
+      continue;
+    }
+    cache->valid_mask[i] = 1;
+    cache->values[i] = (int32_t)raw;
+  }
+
+  collection->gpu_column_cache_count += 1;
+  return true;
+}
+
 static apxdb_index_data_t* find_index_data(apxdb_collection_t* collection, const char* field_name) {
   if (!collection || !field_name) {
     return NULL;
@@ -1034,28 +1165,6 @@ static void free_index_data(apxdb_index_data_t* index) {
   free(index->entries);
 }
 
-static uint64_t compute_schema_signature(const apxdb_schema_t* schema) {
-  if (!schema) {
-    return 0;
-  }
-  uint64_t hash = 1469598103934665603ull;
-  for (size_t i = 0; i < schema->field_count; ++i) {
-    const apxdb_schema_field_t* field = &schema->fields[i];
-    const char* name = field->name ? field->name : "";
-    for (const char* p = name; *p; ++p) {
-      hash ^= (uint64_t)(uint8_t)*p;
-      hash *= 1099511628211ull;
-    }
-    hash ^= (uint64_t)field->type;
-    hash *= 1099511628211ull;
-    hash ^= (uint64_t)field->nullable;
-    hash *= 1099511628211ull;
-  }
-  hash ^= (uint64_t)schema->field_count;
-  hash *= 1099511628211ull;
-  return hash;
-}
-
 static void clear_loaded_index_data(apxdb_collection_t* collection, size_t loaded_count) {
   if (!collection) {
     return;
@@ -1107,6 +1216,7 @@ static void free_collection(apxdb_collection_t* collection) {
     free_index_data(&collection->index_data[i]);
   }
   free(collection->index_data);
+  clear_gpu_column_caches(collection);
   free(collection);
 }
 
@@ -1334,6 +1444,7 @@ static bool append_document(apxdb_collection_t* collection, const char* id, cons
     return false;
   }
   collection->document_count += 1;
+  invalidate_gpu_column_caches(collection);
   return true;
 }
 
@@ -1415,44 +1526,65 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
   }
 
   size_t count = collection->document_count;
-  int32_t* values = (int32_t*)malloc(count * sizeof(int32_t));
-  uint32_t* valid_mask = (uint32_t*)malloc(count * sizeof(uint32_t));
+  apxdb_gpu_column_cache_t* cache = find_gpu_column_cache(collection, field_path);
+  int32_t* values = NULL;
+  uint32_t* valid_mask = NULL;
   uint8_t* mask = (uint8_t*)malloc(count);
-  if (!values || !valid_mask || !mask) {
-    free(values);
-    free(valid_mask);
-    free(mask);
+  if (!mask) {
     return NULL;
   }
 
-  for (size_t i = 0; i < count; ++i) {
-    const apxdb_schema_field_t* payload_field = NULL;
-    const uint8_t* payload = NULL;
-    size_t payload_size = 0;
-    if (!get_blob_field_payload(collection->schema, collection->documents[i].blob, collection->documents[i].blob_size, field_path, &payload_field, &payload, &payload_size)) {
-      valid_mask[i] = 0;
-      values[i] = 0;
-      continue;
+  if (!cache) {
+    if (build_gpu_column_cache(collection, field_path, field)) {
+      cache = find_gpu_column_cache(collection, field_path);
     }
-    if (!payload_field || payload_field->type != APXDB_TYPE_INT || payload_size < sizeof(int64_t)) {
-      valid_mask[i] = 0;
-      values[i] = 0;
-      continue;
-    }
-    int64_t raw;
-    memcpy(&raw, payload, sizeof(raw));
-    if (raw < INT32_MIN || raw > INT32_MAX) {
-      valid_mask[i] = 0;
-      values[i] = 0;
-      continue;
-    }
-    valid_mask[i] = 1;
-    values[i] = (int32_t)raw;
   }
 
+  if (cache) {
+    values = cache->values;
+    valid_mask = cache->valid_mask;
+  } else {
+    values = (int32_t*)malloc(count * sizeof(int32_t));
+    valid_mask = (uint32_t*)malloc(count * sizeof(uint32_t));
+    if (!values || !valid_mask) {
+      free(values);
+      free(valid_mask);
+      free(mask);
+      return NULL;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+      const apxdb_schema_field_t* payload_field = NULL;
+      const uint8_t* payload = NULL;
+      size_t payload_size = 0;
+      if (!get_blob_field_payload(collection->schema, collection->documents[i].blob, collection->documents[i].blob_size, field_path, &payload_field, &payload, &payload_size)) {
+        valid_mask[i] = 0;
+        values[i] = 0;
+        continue;
+      }
+      if (!payload_field || payload_field->type != APXDB_TYPE_INT || payload_size < sizeof(int64_t)) {
+        valid_mask[i] = 0;
+        values[i] = 0;
+        continue;
+      }
+      int64_t raw;
+      memcpy(&raw, payload, sizeof(raw));
+      if (raw < INT32_MIN || raw > INT32_MAX) {
+        valid_mask[i] = 0;
+        values[i] = 0;
+        continue;
+      }
+      valid_mask[i] = 1;
+      values[i] = (int32_t)raw;
+    }
+  }
+
+  bool using_cache = cache != NULL;
   if (!run_gpu_query_int(values, valid_mask, count, op_code, threshold, mask)) {
-    free(values);
-    free(valid_mask);
+    if (!using_cache) {
+      free(values);
+      free(valid_mask);
+    }
     free(mask);
     return NULL;
   }
@@ -1469,7 +1601,10 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
       char** next = (char**)realloc(result, next_capacity * sizeof(char*));
       if (!next) {
         free(result);
-        free(values);
+        if (!using_cache) {
+          free(values);
+          free(valid_mask);
+        }
         free(mask);
         return NULL;
       }
@@ -1479,8 +1614,10 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
     result[(*out_count)++] = collection->documents[i].id;
   }
 
-  free(values);
-  free(valid_mask);
+  if (!using_cache) {
+    free(values);
+    free(valid_mask);
+  }
   free(mask);
   if (*out_count == 0) {
     result = (char**)malloc(0);
@@ -1522,6 +1659,62 @@ static bool ensure_directory_exists(const char* path) {
   return mkdir(path, 0755) == 0;
 }
 
+static uint64_t fnv1a_hash_bytes(uint64_t hash, const void* data, size_t size) {
+  const uint8_t* bytes = (const uint8_t*)data;
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= (uint64_t)bytes[i];
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+static uint64_t fnv1a_hash_string(uint64_t hash, const char* string) {
+  if (!string) {
+    return hash;
+  }
+  return fnv1a_hash_bytes(hash, string, strlen(string));
+}
+
+static uint64_t compute_schema_signature(const apxdb_schema_t* schema);
+
+static uint64_t compute_schema_signature(const apxdb_schema_t* schema) {
+  if (!schema) {
+    return 0;
+  }
+
+  uint64_t hash = 1469598103934665603ull;
+  hash = fnv1a_hash_string(hash, schema->collection_name);
+  hash = fnv1a_hash_bytes(hash, &schema->field_count, sizeof(schema->field_count));
+
+  for (size_t i = 0; i < schema->field_count; ++i) {
+    const apxdb_schema_field_t* field = &schema->fields[i];
+    hash = fnv1a_hash_string(hash, field->name);
+    hash = fnv1a_hash_bytes(hash, &field->type, sizeof(field->type));
+    hash = fnv1a_hash_bytes(hash, &field->nullable, sizeof(field->nullable));
+    hash = fnv1a_hash_bytes(hash, &field->enum_strategy, sizeof(field->enum_strategy));
+    hash = fnv1a_hash_bytes(hash, &field->list_element_type, sizeof(field->list_element_type));
+
+    if (field->type == APXDB_TYPE_EMBEDDED && field->embedded_schema) {
+      uint64_t nested_signature = compute_schema_signature(field->embedded_schema);
+      hash = fnv1a_hash_bytes(hash, &nested_signature, sizeof(nested_signature));
+    }
+    if (field->type == APXDB_TYPE_LIST && field->list_element_schema) {
+      uint64_t nested_signature = compute_schema_signature(field->list_element_schema);
+      hash = fnv1a_hash_bytes(hash, &nested_signature, sizeof(nested_signature));
+    }
+
+    if (field->enum_value_count > 0 && field->enum_values) {
+      for (size_t j = 0; j < field->enum_value_count; ++j) {
+        hash = fnv1a_hash_string(hash, field->enum_values[j].name);
+        hash = fnv1a_hash_bytes(hash, &field->enum_values[j].value, sizeof(field->enum_values[j].value));
+      }
+      hash = fnv1a_hash_bytes(hash, &field->enum_value_count, sizeof(field->enum_value_count));
+    }
+  }
+
+  return hash;
+}
+
 static bool format_collection_file_path(const char* directory_path, const char* collection_name, char* out_path, size_t out_path_size) {
   if (!directory_path || !collection_name || !out_path || out_path_size == 0) {
     return false;
@@ -1561,6 +1754,42 @@ int32_t apxdb_save_all_collections(const char* directory_path) {
   return 0;
 }
 
+static bool ensure_collection_loaded(apxdb_collection_t* collection, const char* directory_path) {
+  if (!collection) {
+    return false;
+  }
+  if (collection->loaded) {
+    return true;
+  }
+
+  const char* storage_directory = directory_path ? directory_path : g_storage_directory;
+  if (!storage_directory) {
+    collection->loaded = true;
+    return true;
+  }
+
+  char path[1024];
+  if (!format_collection_file_path(storage_directory, collection->schema->collection_name, path, sizeof(path))) {
+    return false;
+  }
+
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    if (errno == ENOENT) {
+      collection->loaded = true;
+      return true;
+    }
+    return false;
+  }
+
+  if (!load_collection_from_file(collection, path)) {
+    return false;
+  }
+
+  collection->loaded = true;
+  return true;
+}
+
 int32_t apxdb_load_all_collections(const char* directory_path) {
   if (!directory_path) {
     return -1;
@@ -1569,18 +1798,7 @@ int32_t apxdb_load_all_collections(const char* directory_path) {
     return -1;
   }
   for (size_t i = 0; i < g_collection_count; ++i) {
-    char path[1024];
-    if (!format_collection_file_path(directory_path, g_collections[i]->schema->collection_name, path, sizeof(path))) {
-      return -1;
-    }
-    struct stat st;
-    if (stat(path, &st) != 0) {
-      if (errno == ENOENT) {
-        continue;
-      }
-      return -1;
-    }
-    if (!load_collection_from_file(g_collections[i], path)) {
+    if (!ensure_collection_loaded(g_collections[i], directory_path)) {
       return -1;
     }
   }
@@ -1607,6 +1825,12 @@ static bool save_collection_to_file(apxdb_collection_t* collection, const char* 
     return false;
   }
   if (!write_uint32_to_file(file, kCollectionFileVersion)) {
+    fclose(file);
+    return false;
+  }
+
+  uint64_t schema_signature = compute_schema_signature(collection->schema);
+  if (!write_uint64_to_file(file, schema_signature)) {
     fclose(file);
     return false;
   }
@@ -1791,9 +2015,17 @@ static bool load_collection_index_file(apxdb_collection_t* collection, const cha
   }
 
   uint32_t version;
-  if (!read_uint32_from_file(file, &version) || version != 1) {
+  if (!read_uint32_from_file(file, &version) || (version != 1 && version != 2)) {
     fclose(file);
     return false;
+  }
+
+  if (version == 2) {
+    uint64_t stored_schema_signature;
+    if (!read_uint64_from_file(file, &stored_schema_signature) || stored_schema_signature != compute_schema_signature(collection->schema)) {
+      fclose(file);
+      return false;
+    }
   }
 
   uint32_t name_length;
@@ -1993,10 +2225,18 @@ static bool load_collection_from_file(apxdb_collection_t* collection, const char
     fclose(file);
     return false;
   }
-  if (version != 1) {
+  if (version != 1 && version != 2) {
     fprintf(stderr, "load_collection_from_file: unsupported version %u in %s\n", version, file_path);
     fclose(file);
     return false;
+  }
+
+  if (version == 2) {
+    uint64_t stored_schema_signature;
+    if (!read_uint64_from_file(file, &stored_schema_signature) || stored_schema_signature != compute_schema_signature(collection->schema)) {
+      fclose(file);
+      return false;
+    }
   }
 
   uint32_t name_length;
@@ -2583,6 +2823,87 @@ static const apxdb_json_value_t* json_path_get(const apxdb_json_value_t* value, 
 }
 
 #if defined(APXDB_ENABLE_DIAGNOSTICS)
+static apxdb_query_metrics_t g_last_query_metrics = {0};
+
+static uint64_t now_ns(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0;
+  }
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void reset_last_query_metrics(void) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  memset(&g_last_query_metrics, 0, sizeof(g_last_query_metrics));
+  g_last_query_metrics.path = APXDB_QUERY_CPU_ONLY;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void update_last_query_metrics_path(apxdb_query_path_t path) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.path = path;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void set_last_query_metrics_result_count(uint64_t count) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.result_count = count;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void add_last_query_metrics_bytes_uploaded(uint64_t bytes) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.bytes_uploaded += bytes;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void add_last_query_metrics_bytes_reused(uint64_t bytes) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.bytes_reused += bytes;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void add_last_query_metrics_cpu_prepare_ns(uint64_t ns) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.cpu_prepare_ns += ns;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void add_last_query_metrics_gpu_exec_ns(uint64_t ns) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.gpu_exec_ns += ns;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void set_last_query_metrics_total_ns(uint64_t ns) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.total_ns = ns;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void increment_last_query_metrics_cache_hit(void) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.cache_hits += 1;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void increment_last_query_metrics_cache_miss(void) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.cache_misses += 1;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+int32_t apxdb_last_query_metrics(apxdb_query_metrics_t* out_metrics) {
+  if (!out_metrics) {
+    return -1;
+  }
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  *out_metrics = g_last_query_metrics;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+  return 0;
+}
+
 static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count) {
   pthread_mutex_lock(&g_query_diagnostics_mutex);
   g_last_query_path = path;
@@ -2590,6 +2911,24 @@ static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count) 
   pthread_mutex_unlock(&g_query_diagnostics_mutex);
 }
 #else
+static void reset_last_query_metrics(void) {
+}
+static void update_last_query_metrics_path(apxdb_query_path_t path) { (void)path; }
+static void set_last_query_metrics_result_count(uint64_t count) { (void)count; }
+static void add_last_query_metrics_bytes_uploaded(uint64_t bytes) { (void)bytes; }
+static void add_last_query_metrics_bytes_reused(uint64_t bytes) { (void)bytes; }
+static void add_last_query_metrics_cpu_prepare_ns(uint64_t ns) { (void)ns; }
+static void add_last_query_metrics_gpu_exec_ns(uint64_t ns) { (void)ns; }
+static void set_last_query_metrics_total_ns(uint64_t ns) { (void)ns; }
+static void increment_last_query_metrics_cache_hit(void) {}
+static void increment_last_query_metrics_cache_miss(void) {}
+int32_t apxdb_last_query_metrics(apxdb_query_metrics_t* out_metrics) {
+  if (!out_metrics) {
+    return -1;
+  }
+  memset(out_metrics, 0, sizeof(*out_metrics));
+  return -1;
+}
 static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count) {
   (void)path;
   (void)count;
@@ -2801,7 +3140,7 @@ const char* apxdb_get_document(const char* collection_name, const char* id) {
     return NULL;
   }
   apxdb_collection_t* collection = find_collection(collection_name);
-  if (!collection) {
+  if (!collection || !ensure_collection_loaded(collection, NULL)) {
     return NULL;
   }
   apxdb_collection_document_t* doc = find_document_by_id(collection, id);
@@ -3036,7 +3375,7 @@ const char* apxdb_find_documents(const char* collection_name, const char* query_
     return NULL;
   }
   apxdb_collection_t* collection = find_collection(collection_name);
-  if (!collection) {
+  if (!collection || !ensure_collection_loaded(collection, NULL)) {
     return NULL;
   }
   if (query_json && *query_json) {
@@ -3066,7 +3405,7 @@ const char* apxdb_put_document(const char* collection_name, const char* json_utf
     return NULL;
   }
   apxdb_collection_t* collection = find_collection(collection_name);
-  if (!collection) {
+  if (!collection || !ensure_collection_loaded(collection, NULL)) {
     return NULL;
   }
   if (!validate_document_against_schema(collection->schema, json_utf8)) {
@@ -3122,7 +3461,7 @@ int32_t apxdb_delete_document(const char* collection_name, const char* id) {
     return -1;
   }
   apxdb_collection_t* collection = find_collection(collection_name);
-  if (!collection) {
+  if (!collection || !ensure_collection_loaded(collection, NULL)) {
     return -1;
   }
   for (size_t i = 0; i < collection->document_count; ++i) {
@@ -3135,6 +3474,7 @@ int32_t apxdb_delete_document(const char* collection_name, const char* id) {
         collection->documents[j - 1] = collection->documents[j];
       }
       collection->document_count -= 1;
+      invalidate_gpu_column_caches(collection);
       collection->dirty = true;
       return 0;
     }
@@ -3147,7 +3487,7 @@ int32_t apxdb_save_collection(const char* collection_name, const char* file_path
     return -1;
   }
   apxdb_collection_t* collection = find_collection(collection_name);
-  if (!collection) {
+  if (!collection || !ensure_collection_loaded(collection, NULL)) {
     return -1;
   }
   bool saved = save_collection_to_file(collection, file_path);
@@ -3165,7 +3505,11 @@ int32_t apxdb_load_collection(const char* collection_name, const char* file_path
   if (!collection) {
     return -1;
   }
-  return load_collection_from_file(collection, file_path) ? 0 : -1;
+  if (!load_collection_from_file(collection, file_path)) {
+    return -1;
+  }
+  collection->loaded = true;
+  return 0;
 }
 
 static void free_collections(void) {

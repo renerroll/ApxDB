@@ -61,8 +61,21 @@ int32_t apxdb_gpu_status(void);
 
 // Debug-only helpers. Use for single-threaded diagnostics and benchmark
 // harnesses only. These values are global and are not thread-safe.
+typedef struct {
+  uint64_t bytes_uploaded;
+  uint64_t bytes_reused;
+  uint64_t cache_hits;
+  uint64_t cache_misses;
+  uint64_t result_count;
+  uint64_t cpu_prepare_ns;
+  uint64_t gpu_exec_ns;
+  uint64_t total_ns;
+  apxdb_query_path_t path;
+} apxdb_query_metrics_t;
+
 int32_t apxdb_last_query_path(void);
 uint32_t apxdb_last_query_doc_count(void);
+int32_t apxdb_last_query_metrics(apxdb_query_metrics_t* out_metrics);
 const char* apxdb_create_document(const char* json_utf8);
 const char* apxdb_find_document(const char* query_utf8);
 void apxdb_release_string(const char* utf8);

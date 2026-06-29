@@ -29,7 +29,7 @@ static bool g_initialized = false;
 static apxdb_state_t g_state = APXDB_STATE_CLOSED;
 static bool g_gpu_available = false;
 static apxdb_gpu_status_t g_gpu_status = APXDB_GPU_UNAVAILABLE;
-static char* g_storage_directory = NULL;
+char* g_storage_directory = NULL;
 static apxdb_document_t* g_documents = NULL;
 static size_t g_document_count = 0;
 static size_t g_document_capacity = 0;
@@ -824,14 +824,6 @@ int32_t apxdb_open(const char* directory_path) {
     set_state(APXDB_STATE_FAILED);
     pthread_mutex_unlock(&g_mutex);
     return APXDB_ERR_UNKNOWN;
-  }
-
-  // Load collection data and persistent index metadata if available.
-  if (apxdb_load_all_collections(directory_path) != 0) {
-    cleanup_partial_open();
-    set_state(APXDB_STATE_FAILED);
-    pthread_mutex_unlock(&g_mutex);
-    return APXDB_ERR_IO;
   }
 
   set_state(APXDB_STATE_OPEN);
