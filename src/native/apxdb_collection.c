@@ -1530,6 +1530,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
   apxdb_gpu_column_cache_t* cache = find_gpu_column_cache(collection, field_path);
   int32_t* values = NULL;
   uint32_t* valid_mask = NULL;
+  bool owns_temp_buffers = false;
   uint8_t* mask = (uint8_t*)malloc(count);
   if (!mask) {
     return NULL;
@@ -1544,6 +1545,8 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
     }
   }
 
+  using_cache = cache != NULL;
+
   if (cache) {
     values = cache->values;
     valid_mask = cache->valid_mask;
@@ -1556,6 +1559,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
       free(mask);
       return NULL;
     }
+    owns_temp_buffers = true;
 
     for (size_t i = 0; i < count; ++i) {
       const apxdb_schema_field_t* payload_field = NULL;
@@ -1598,7 +1602,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
   uint64_t gpu_start_ns = now_ns();
   if (!run_gpu_query_int(values, valid_mask, count, op_code, threshold, mask)) {
     add_last_query_metrics_gpu_exec_ns(now_ns() - gpu_start_ns);
-    if (!using_cache) {
+    if (owns_temp_buffers) {
       free(values);
       free(valid_mask);
     }
@@ -1619,7 +1623,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
       char** next = (char**)realloc(result, next_capacity * sizeof(char*));
       if (!next) {
         free(result);
-        if (!using_cache) {
+        if (owns_temp_buffers) {
           free(values);
           free(valid_mask);
         }
@@ -1632,7 +1636,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
     result[(*out_count)++] = collection->documents[i].id;
   }
 
-  if (!using_cache) {
+  if (owns_temp_buffers) {
     free(values);
     free(valid_mask);
   }
@@ -1690,8 +1694,6 @@ static uint64_t fnv1a_hash_string(uint64_t hash, const char* string) {
   }
   return fnv1a_hash_bytes(hash, string, strlen(string));
 }
-
-static uint64_t compute_schema_signature(const apxdb_schema_t* schema);
 
 static uint64_t compute_schema_signature(const apxdb_schema_t* schema) {
   if (!schema) {

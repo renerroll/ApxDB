@@ -280,6 +280,57 @@ static void run_test_stale_doc_ids_reject(const char* dir) {
   free(idx_path);
 }
 
+static void run_test_gpu_numeric_query_path(const char* dir) {
+  cleanup_test_files(dir);
+  printf("TEST: gpu_numeric_query_path\n");
+
+  register_test_collection();
+  ASSERT(open_db(dir), "open_db failed");
+
+  apxdb_transaction_t* txn = apxdb_begin_write_txn();
+  ASSERT(txn != NULL, "begin transaction failed");
+
+  const int doc_count = 200;
+  for (int i = 0; i < doc_count; ++i) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"value\": %d, \"name\": \"doc%d\"}", i, i);
+    const char* id = apxdb_put_document("test_collection", json);
+    ASSERT(id != NULL, "put_document failed");
+    apxdb_release_string(id);
+  }
+
+  int32_t result = apxdb_commit_write_txn(txn);
+  ASSERT(result == 0, "commit transaction failed");
+  apxdb_free_transaction(txn);
+
+  const char* query = "{\"value\": {\"gte\": 0}}";
+  const char* result_json = apxdb_find_documents("test_collection", query);
+  ASSERT(result_json != NULL, "first find_documents returned NULL");
+  int count = count_substring(result_json, "\"name\"");
+  apxdb_release_string(result_json);
+  ASSERT(count == doc_count, "unexpected first query result count");
+
+  int32_t gpu_status = apxdb_gpu_status();
+  int32_t query_path = apxdb_last_query_path();
+  if (gpu_status == APXDB_GPU_METAL_ACTIVE || gpu_status == APXDB_GPU_VULKAN_ACTIVE) {
+    ASSERT(query_path == APXDB_QUERY_GPU_USED, "expected first query to use GPU path");
+  }
+
+  const char* second_json = apxdb_find_documents("test_collection", query);
+  ASSERT(second_json != NULL, "second find_documents returned NULL");
+  int second_count = count_substring(second_json, "\"name\"");
+  apxdb_release_string(second_json);
+  ASSERT(second_count == doc_count, "unexpected second query result count");
+
+  apxdb_query_metrics_t metrics;
+  ASSERT(apxdb_last_query_metrics(&metrics) == 0, "failed to read last query metrics");
+  if (gpu_status == APXDB_GPU_METAL_ACTIVE || gpu_status == APXDB_GPU_VULKAN_ACTIVE) {
+    ASSERT(metrics.cache_hits > 0, "expected GPU cache hit on second query");
+  }
+
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+}
+
 int main(void) {
   char* dir = make_temp_dir();
   ASSERT(dir != NULL, "failed to create temporary directory");
@@ -289,6 +340,7 @@ int main(void) {
   run_test_declaration_mismatch(dir);
   run_test_missing_idx_rebuild(dir);
   run_test_stale_doc_ids_reject(dir);
+  run_test_gpu_numeric_query_path(dir);
 
   printf("All apxdb index persistence tests passed.\n");
   rmdir(dir);

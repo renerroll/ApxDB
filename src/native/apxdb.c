@@ -210,25 +210,41 @@ static const char kMetalShaderSource[] =
 static bool initialize_metal_backend(void) {
   g_metal_device = MTLCreateSystemDefaultDevice();
   if (!g_metal_device) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal device unavailable\n");
+#endif
     return false;
   }
   g_metal_command_queue = [g_metal_device newCommandQueue];
   if (!g_metal_command_queue) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal command queue creation failed\n");
+#endif
     return false;
   }
   NSError* error = nil;
   NSString* source = [NSString stringWithUTF8String:kMetalShaderSource];
   g_metal_library = [g_metal_device newLibraryWithSource:source options:nil error:&error];
   if (!g_metal_library) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal library build failed: %s\n", [[error localizedDescription] UTF8String]);
+#endif
+    cleanup_metal_backend();
     return false;
   }
   id<MTLFunction> function = [g_metal_library newFunctionWithName:@"documentCompute"];
   if (!function) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal function lookup failed\n");
+#endif
     cleanup_metal_backend();
     return false;
   }
   g_metal_pipeline = [g_metal_device newComputePipelineStateWithFunction:function error:&error];
   if (!g_metal_pipeline) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal pipeline creation failed: %s\n", [[error localizedDescription] UTF8String]);
+#endif
     cleanup_metal_backend();
     return false;
   }
@@ -748,6 +764,9 @@ static void init_gpu_backend(void) {
   cleanup_gpu_backend();
   g_gpu_available = initialize_metal_backend();
   set_gpu_status(g_gpu_available ? APXDB_GPU_METAL_ACTIVE : APXDB_GPU_INIT_FAILED);
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+  fprintf(stderr, "apxdb: init_gpu_backend() status=%d\n", (int)g_gpu_status);
+#endif
 #else
   g_gpu_available = false;
   set_gpu_status(APXDB_GPU_UNAVAILABLE);
