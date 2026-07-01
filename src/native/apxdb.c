@@ -735,13 +735,31 @@ bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t
   [encoder setBuffer:params_buffer offset:0 atIndex:3];
 
   MTLSize gridSize = MTLSizeMake(count, 1, 1);
-  NSUInteger threadGroupSize = g_metal_pipeline.maxTotalThreadsPerThreadgroup;
+  NSUInteger width = g_metal_pipeline.threadExecutionWidth;
+  NSUInteger maxThreads = g_metal_pipeline.maxTotalThreadsPerThreadgroup;
+  NSUInteger threadGroupSize = width * 4;
+  if (threadGroupSize > maxThreads) {
+    threadGroupSize = maxThreads;
+  }
   if (threadGroupSize > count) {
     threadGroupSize = count;
+  }
+  if (width > 0) {
+    threadGroupSize = (threadGroupSize / width) * width;
+    if (threadGroupSize == 0) {
+      threadGroupSize = width;
+    }
   }
   if (threadGroupSize == 0) {
     threadGroupSize = 1;
   }
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+  fprintf(stderr, "apxdb: gpu dispatch count=%zu threadExecutionWidth=%lu threadgroup=%lu maxPerGroup=%lu\n",
+          count,
+          (unsigned long)width,
+          (unsigned long)threadGroupSize,
+          (unsigned long)maxThreads);
+#endif
   MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
   [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
   [encoder endEncoding];

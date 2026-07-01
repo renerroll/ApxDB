@@ -15,6 +15,8 @@
 
 #include "apxdb.h"
 
+extern bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t count, int op, int32_t threshold, uint8_t* out_mask);
+
 static char* make_temp_dir(void) {
   char template[] = "/tmp/apxdb_gpu_cpu_benchXXXXXX";
   char* dir = mkdtemp(template);
@@ -183,6 +185,94 @@ static bool run_benchmark(const char* dir, bool gpu_enabled) {
   return close_ok;
 }
 
+static bool run_raw_gpu_cpu_benchmark(void) {
+  const size_t count = 1 * 1024 * 1024;
+  const int32_t threshold = 5000;
+  const int runs = 7;
+  int32_t* values = (int32_t*)malloc(count * sizeof(int32_t));
+  uint32_t* valid_mask = (uint32_t*)malloc(count * sizeof(uint32_t));
+  uint8_t* mask = (uint8_t*)malloc(count);
+  if (!values || !valid_mask || !mask) {
+    fprintf(stderr, "failed to allocate raw benchmark buffers\n");
+    free(values);
+    free(valid_mask);
+    free(mask);
+    return false;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    values[i] = (int32_t)(i % 10000);
+    valid_mask[i] = 1;
+    mask[i] = 0;
+  }
+
+  printf("\n=== raw CPU/GPU compute benchmark ===\n");
+  apxdb_set_gpu_enabled(true);
+  int32_t gpu_init = apxdb_initialize();
+  if (gpu_init != APXDB_OK && gpu_init != APXDB_OK_GPU_FALLBACK) {
+    fprintf(stderr, "raw benchmark: failed to initialize apxdb GPU backend (%d)\n", gpu_init);
+    free(values);
+    free(valid_mask);
+    free(mask);
+    return false;
+  }
+
+  double cpu_time = 0.0;
+  int64_t cpu_hits = 0;
+  for (int r = 0; r < runs; ++r) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int64_t hits = 0;
+    for (size_t i = 0; i < count; ++i) {
+      if (valid_mask[i] && values[i] >= threshold) {
+        hits++;
+      }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    if (r == 0) {
+      cpu_hits = hits;
+    }
+    cpu_time += diff_ms(start, end);
+  }
+  cpu_time /= runs;
+
+  double gpu_time = 0.0;
+  int64_t gpu_hits = 0;
+  for (int r = 0; r < runs; ++r) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if (!run_gpu_query_int(values, valid_mask, count, 2, threshold, mask)) {
+      fprintf(stderr, "run_gpu_query_int failed\n");
+      free(values);
+      free(valid_mask);
+      free(mask);
+      return false;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    int64_t hits = 0;
+    for (size_t i = 0; i < count; ++i) {
+      if (mask[i]) {
+        hits++;
+      }
+    }
+    if (r == 0) {
+      gpu_hits = hits;
+    }
+    gpu_time += diff_ms(start, end);
+  }
+  gpu_time /= runs;
+
+  printf("raw count=%zu threshold=%d runs=%d\n", count, threshold, runs);
+  printf("CPU time avg=%.3fms hits=%lld\n", cpu_time, (long long)cpu_hits);
+  printf("GPU time avg=%.3fms hits=%lld\n", gpu_time, (long long)gpu_hits);
+
+  apxdb_shutdown();
+  free(values);
+  free(valid_mask);
+  free(mask);
+  return true;
+}
+
 static bool open_and_populate(const char* dir) {
   apxdb_set_gpu_enabled(false);
   int32_t result = apxdb_open(dir);
@@ -221,6 +311,11 @@ int main(void) {
   }
 
   if (!run_benchmark(dir, true)) {
+    free_temp_dir(dir);
+    return 1;
+  }
+
+  if (!run_raw_gpu_cpu_benchmark()) {
     free_temp_dir(dir);
     return 1;
   }
