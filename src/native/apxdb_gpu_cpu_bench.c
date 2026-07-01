@@ -16,6 +16,7 @@
 #include "apxdb.h"
 
 extern bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t count, int op, int32_t threshold, uint8_t* out_mask);
+extern bool run_gpu_query_int_count(const int32_t* values, const uint32_t* valid_mask, size_t count, int op, int32_t threshold, uint32_t* out_count);
 
 static char* make_temp_dir(void) {
   char template[] = "/tmp/apxdb_gpu_cpu_benchXXXXXX";
@@ -191,19 +192,16 @@ static bool run_raw_gpu_cpu_benchmark(void) {
   const int runs = 7;
   int32_t* values = (int32_t*)malloc(count * sizeof(int32_t));
   uint32_t* valid_mask = (uint32_t*)malloc(count * sizeof(uint32_t));
-  uint8_t* mask = (uint8_t*)malloc(count);
-  if (!values || !valid_mask || !mask) {
+  if (!values || !valid_mask) {
     fprintf(stderr, "failed to allocate raw benchmark buffers\n");
     free(values);
     free(valid_mask);
-    free(mask);
     return false;
   }
 
   for (size_t i = 0; i < count; ++i) {
     values[i] = (int32_t)(i % 10000);
     valid_mask[i] = 1;
-    mask[i] = 0;
   }
 
   printf("\n=== raw CPU/GPU compute benchmark ===\n");
@@ -213,7 +211,6 @@ static bool run_raw_gpu_cpu_benchmark(void) {
     fprintf(stderr, "raw benchmark: failed to initialize apxdb GPU backend (%d)\n", gpu_init);
     free(values);
     free(valid_mask);
-    free(mask);
     return false;
   }
 
@@ -237,26 +234,20 @@ static bool run_raw_gpu_cpu_benchmark(void) {
   cpu_time /= runs;
 
   double gpu_time = 0.0;
-  int64_t gpu_hits = 0;
+  uint32_t gpu_hits = 0;
   for (int r = 0; r < runs; ++r) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    if (!run_gpu_query_int(values, valid_mask, count, 2, threshold, mask)) {
-      fprintf(stderr, "run_gpu_query_int failed\n");
+    uint32_t count_result = 0;
+    if (!run_gpu_query_int_count(values, valid_mask, count, 2, threshold, &count_result)) {
+      fprintf(stderr, "run_gpu_query_int_count failed\n");
       free(values);
       free(valid_mask);
-      free(mask);
       return false;
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
-    int64_t hits = 0;
-    for (size_t i = 0; i < count; ++i) {
-      if (mask[i]) {
-        hits++;
-      }
-    }
     if (r == 0) {
-      gpu_hits = hits;
+      gpu_hits = count_result;
     }
     gpu_time += diff_ms(start, end);
   }
@@ -264,12 +255,11 @@ static bool run_raw_gpu_cpu_benchmark(void) {
 
   printf("raw count=%zu threshold=%d runs=%d\n", count, threshold, runs);
   printf("CPU time avg=%.3fms hits=%lld\n", cpu_time, (long long)cpu_hits);
-  printf("GPU time avg=%.3fms hits=%lld\n", gpu_time, (long long)gpu_hits);
+  printf("GPU time avg=%.3fms hits=%u\n", gpu_time, gpu_hits);
 
   apxdb_shutdown();
   free(values);
   free(valid_mask);
-  free(mask);
   return true;
 }
 
