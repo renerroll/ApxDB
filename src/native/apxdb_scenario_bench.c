@@ -8,12 +8,193 @@
 #include <time.h>
 
 #include "apxdb.h"
+#include "apxdb_json.h"
+
+#define MAX_CSV_FIELDS 64
+#define MAX_FIELD_LENGTH 4096
 
 static double diff_ms(struct timespec start, struct timespec end) {
   return (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6;
 }
 
 static bool schema_used = true;
+static apxdb_schema_field_t* testdb_schema_fields = NULL;
+static apxdb_schema_t testdb_schema = {"testdb", NULL, 0};
+
+static char* trim_whitespace(char* value) {
+  if (!value) {
+    return NULL;
+  }
+  char* start = value;
+  while (*start && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) {
+    start++;
+  }
+  char* end = start + strlen(start);
+  while (end > start && (*(end - 1) == ' ' || *(end - 1) == '\t' || *(end - 1) == '\r' || *(end - 1) == '\n')) {
+    end--;
+  }
+  *end = '\0';
+  return start;
+}
+
+static bool parse_csv_row(const char* line, char** fields, size_t max_fields, size_t* field_count) {
+  char buffer[MAX_FIELD_LENGTH];
+  size_t buffer_index = 0;
+  size_t idx = 0;
+  bool in_quotes = false;
+
+  for (const char* p = line; ; ++p) {
+    char c = *p;
+    if (in_quotes) {
+      if (c == '"') {
+        if (*(p + 1) == '"') {
+          if (buffer_index + 1 >= sizeof(buffer)) return false;
+          buffer[buffer_index++] = '"';
+          ++p;
+        } else {
+          in_quotes = false;
+        }
+      } else if (c == '\0') {
+        break;
+      } else {
+        if (buffer_index + 1 >= sizeof(buffer)) return false;
+        buffer[buffer_index++] = c;
+      }
+    } else {
+      if (c == '"') {
+        in_quotes = true;
+      } else if (c == ',' || c == '\0' || c == '\n' || c == '\r') {
+        buffer[buffer_index] = '\0';
+        if (idx >= max_fields) {
+          return false;
+        }
+        fields[idx] = strdup(trim_whitespace(buffer));
+        if (!fields[idx]) {
+          return false;
+        }
+        idx++;
+        buffer_index = 0;
+        if (c == '\0' || c == '\n') {
+          break;
+        }
+      } else {
+        if (buffer_index + 1 >= sizeof(buffer)) return false;
+        buffer[buffer_index++] = c;
+      }
+    }
+  }
+
+  *field_count = idx;
+  return true;
+}
+
+static bool is_integer_value(const char* value) {
+  if (!value || *value == '\0') {
+    return false;
+  }
+  const char* s = value;
+  if (*s == '+' || *s == '-') {
+    s++;
+  }
+  if (!*s) {
+    return false;
+  }
+  while (*s) {
+    if (*s < '0' || *s > '9') {
+      return false;
+    }
+    s++;
+  }
+  return true;
+}
+
+static bool infer_csv_schema(const char* csv_path, apxdb_schema_t* out_schema) {
+  FILE* file = fopen(csv_path, "r");
+  if (!file) {
+    return false;
+  }
+
+  char* line = NULL;
+  size_t len = 0;
+  ssize_t read;
+  if ((read = getline(&line, &len, file)) <= 0) {
+    free(line);
+    fclose(file);
+    return false;
+  }
+
+  char* header_fields[MAX_CSV_FIELDS];
+  size_t header_count = 0;
+  if (!parse_csv_row(line, header_fields, MAX_CSV_FIELDS, &header_count)) {
+    free(line);
+    fclose(file);
+    return false;
+  }
+
+  bool int_candidate[MAX_CSV_FIELDS] = {0};
+  bool has_blank[MAX_CSV_FIELDS] = {0};
+  for (size_t i = 0; i < header_count; ++i) {
+    int_candidate[i] = true;
+  }
+
+  while ((read = getline(&line, &len, file)) != -1) {
+    char* cols[MAX_CSV_FIELDS] = {0};
+    size_t cols_count = 0;
+    if (!parse_csv_row(line, cols, MAX_CSV_FIELDS, &cols_count)) {
+      break;
+    }
+    for (size_t i = 0; i < header_count; ++i) {
+      const char* value = i < cols_count ? cols[i] : "";
+      if (!value || *value == '\0') {
+        has_blank[i] = true;
+        continue;
+      }
+      if (!is_integer_value(value)) {
+        int_candidate[i] = false;
+      }
+    }
+    for (size_t i = 0; i < cols_count; ++i) {
+      free(cols[i]);
+    }
+  }
+
+  free(line);
+  fclose(file);
+
+  apxdb_schema_field_t* fields = calloc(header_count, sizeof(apxdb_schema_field_t));
+  if (!fields) {
+    return false;
+  }
+
+  for (size_t i = 0; i < header_count; ++i) {
+    fields[i].name = header_fields[i];
+    fields[i].type = int_candidate[i] ? APXDB_TYPE_INT : APXDB_TYPE_STRING;
+    fields[i].nullable = has_blank[i];
+    fields[i].embedded_schema = NULL;
+    fields[i].list_element_type = 0;
+    fields[i].list_element_schema = NULL;
+    fields[i].enum_strategy = APXDB_ENUM_STRATEGY_ORDINAL;
+    fields[i].enum_values = NULL;
+    fields[i].enum_value_count = 0;
+  }
+
+  out_schema->collection_name = "testdb";
+  out_schema->fields = fields;
+  out_schema->field_count = header_count;
+  return true;
+}
+
+static void free_testdb_schema(void) {
+  if (!testdb_schema.fields) {
+    return;
+  }
+  for (size_t i = 0; i < testdb_schema.field_count; ++i) {
+    free((char*)testdb_schema.fields[i].name);
+  }
+  free((void*)testdb_schema.fields);
+  testdb_schema.fields = NULL;
+  testdb_schema.field_count = 0;
+}
 
 static bool run_import_csv(const char* csv_path, const char* db_dir, size_t* out_rows) {
   struct timespec start, end;
@@ -30,24 +211,6 @@ static bool run_import_csv(const char* csv_path, const char* db_dir, size_t* out
   printf("import runtime=%.3fms\n", diff_ms(start, end));
   return true;
 }
-
-static const apxdb_schema_field_t testdb_schema_fields[] = {
-  {"description", APXDB_TYPE_STRING, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-  {"industry", APXDB_TYPE_STRING, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-  {"level", APXDB_TYPE_INT, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-  {"size", APXDB_TYPE_STRING, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-  {"line_code", APXDB_TYPE_STRING, true, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-  {"value", APXDB_TYPE_INT, true, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-  {"status", APXDB_TYPE_STRING, true, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-  {"Unit", APXDB_TYPE_STRING, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-  {"Footnotes", APXDB_TYPE_STRING, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
-};
-
-static const apxdb_schema_t testdb_schema = {
-  "testdb",
-  testdb_schema_fields,
-  sizeof(testdb_schema_fields) / sizeof(testdb_schema_fields[0]),
-};
 
 static bool run_query(const char* mode, bool gpu_enabled, const char* query, const char* label) {
   apxdb_set_gpu_enabled(gpu_enabled);
@@ -83,10 +246,16 @@ static bool run_query(const char* mode, bool gpu_enabled, const char* query, con
   }
 
   int hits = 0;
-  const char* p = result;
-  while ((p = strstr(p, "\"id\"")) != NULL) {
-    hits++;
-    p += 4;
+  apxdb_json_value_t json_result;
+  if (apxdb_json_parse(result, &json_result) && json_result.type == APXDB_JSON_ARRAY) {
+    hits = (int)json_result.u.array.count;
+    apxdb_json_free(&json_result);
+  } else {
+    const char* p = result;
+    while ((p = strstr(p, "\"id\"")) != NULL) {
+      hits++;
+      p += 4;
+    }
   }
   apxdb_release_string(result);
 
@@ -163,7 +332,7 @@ static bool run_write_benchmark(const char* mode, bool gpu_enabled, size_t count
   clock_gettime(CLOCK_MONOTONIC, &start);
   for (size_t i = 0; i < count; ++i) {
     char json[1024];
-    snprintf(json, sizeof(json), "{\"description\": \"bench insert %zu\", \"industry\": \"bench\", \"level\": %zu, \"size\": \"n/a\", \"line_code\": \"L%zu\", \"value\": %zu, \"status\": \"ok\", \"Unit\": \"items\", \"Footnotes\": \"bench\"}", i, i, i, i);
+    snprintf(json, sizeof(json), "{\"description\": \"bench insert %zu\", \"industry\": \"bench\", \"level\": %zu, \"size\": \"n/a\", \"line_code\": \"L%zu\", \"value\": %zu, \"status\": %zu, \"Unit\": \"items\", \"Footnotes\": \"bench\"}", i, i, i, i, i);
     const char* id = apxdb_put_document("testdb", json);
     if (!id) {
       apxdb_rollback_write_txn(txn);
@@ -192,9 +361,15 @@ int main(int argc, char** argv) {
   const char* db_dir = "/tmp/apxdb_testdb";
   size_t rows = 0;
 
+  if (!infer_csv_schema(csv_path, &testdb_schema)) {
+    fprintf(stderr, "failed to infer schema from CSV '%s'\n", csv_path);
+    return 1;
+  }
+
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC, &start);
   if (!run_import_csv(csv_path, db_dir, &rows)) {
+    free_testdb_schema();
     return 1;
   }
   clock_gettime(CLOCK_MONOTONIC, &end);
@@ -217,5 +392,6 @@ int main(int argc, char** argv) {
   run_id_search("CPU", false, "doc_1");
   run_id_search("CPU", false, "doc_100");
 
+  free_testdb_schema();
   return 0;
 }
