@@ -1530,6 +1530,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
   apxdb_gpu_column_cache_t* cache = find_gpu_column_cache(collection, field_path);
   int32_t* values = NULL;
   uint32_t* valid_mask = NULL;
+
   bool owns_temp_buffers = false;
   uint8_t* mask = (uint8_t*)malloc(count);
   if (!mask) {
