@@ -2,6 +2,7 @@
 #define APXDB_NATIVE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "apxdb_schema.h"
 #include "apxdb_collection.h"
 
@@ -58,6 +59,7 @@ int32_t apxdb_shutdown();
 int32_t apxdb_open(const char* directory_path);
 int32_t apxdb_close(void);
 int32_t apxdb_gpu_status(void);
+void apxdb_set_gpu_enabled(bool enabled);
 
 // Debug-only helpers. Use for single-threaded diagnostics and benchmark
 // harnesses only. These values are global and are not thread-safe.

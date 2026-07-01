@@ -125,10 +125,17 @@ int32_t apxdb_gpu_status(void) {
   return status;
 }
 
+static bool g_gpu_force_disabled = false;
 static void cleanup_gpu_backend(void);
 static void set_state(apxdb_state_t state) {
   g_state = state;
   g_initialized = (state == APXDB_STATE_OPEN);
+}
+
+void apxdb_set_gpu_enabled(bool enabled) {
+  pthread_mutex_lock(&g_mutex);
+  g_gpu_force_disabled = !enabled;
+  pthread_mutex_unlock(&g_mutex);
 }
 
 static void set_gpu_status(apxdb_gpu_status_t status) {
@@ -759,6 +766,12 @@ bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t
 }
 
 static void init_gpu_backend(void) {
+  if (g_gpu_force_disabled) {
+    cleanup_gpu_backend();
+    g_gpu_available = false;
+    set_gpu_status(APXDB_GPU_UNAVAILABLE);
+    return;
+  }
 #ifdef __APPLE__
 #ifdef __OBJC__
   cleanup_gpu_backend();
