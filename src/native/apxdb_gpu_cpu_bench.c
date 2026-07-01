@@ -39,6 +39,18 @@ static double diff_ms(struct timespec start, struct timespec end) {
 
 static const int kBenchmarkDocCount = 20000;
 
+typedef struct {
+  const char* query;
+  double wall_time_ms;
+  int gpu_status;
+  int query_path;
+  uint64_t result_hits;
+  uint64_t bytes_uploaded;
+  uint64_t bytes_reused;
+  uint64_t cache_hits;
+  uint64_t cache_misses;
+} benchmark_result_t;
+
 static bool create_test_data(void) {
   apxdb_transaction_t* txn = apxdb_begin_write_txn();
   if (!txn) {
@@ -72,7 +84,7 @@ static const apxdb_schema_t benchmark_schema = {
   2,
 };
 
-static bool run_query_benchmark(const char* mode, const char* query) {
+static bool run_query_benchmark(const char* mode, const char* query, const char* label, benchmark_result_t* out_result) {
   printf("--- %s benchmark: %s\n", mode, query);
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC, &start);
@@ -89,25 +101,25 @@ static bool run_query_benchmark(const char* mode, const char* query) {
     memset(&metrics, 0, sizeof(metrics));
   }
 
-  uint64_t hits = metrics.result_count;
-  if (!metrics_ok) {
-    const char* p = result;
-    while ((p = strstr(p, "\"category\"")) != NULL) {
-      hits++;
-      p += 10;
-    }
-  }
-  apxdb_release_string(result);
+  out_result->query = label;
+  out_result->wall_time_ms = diff_ms(start, end);
+  out_result->gpu_status = apxdb_gpu_status();
+  out_result->query_path = apxdb_last_query_path();
+  out_result->result_hits = metrics.result_count;
+  out_result->bytes_uploaded = metrics.bytes_uploaded;
+  out_result->bytes_reused = metrics.bytes_reused;
+  out_result->cache_hits = metrics.cache_hits;
+  out_result->cache_misses = metrics.cache_misses;
 
   printf("  wall_time_ms=%.3f gpu_status=%d query_path=%d result_hits=%" PRIu64 " bytes_uploaded=%" PRIu64 " bytes_reused=%" PRIu64 " cache_hits=%" PRIu64 " cache_misses=%" PRIu64 "\n",
-         diff_ms(start, end),
-         apxdb_gpu_status(),
-         apxdb_last_query_path(),
-         hits,
-         metrics.bytes_uploaded,
-         metrics.bytes_reused,
-         metrics.cache_hits,
-         metrics.cache_misses);
+         out_result->wall_time_ms,
+         out_result->gpu_status,
+         out_result->query_path,
+         out_result->result_hits,
+         out_result->bytes_uploaded,
+         out_result->bytes_reused,
+         out_result->cache_hits,
+         out_result->cache_misses);
   return true;
 }
 
@@ -139,14 +151,30 @@ static bool run_benchmark(const char* dir, bool gpu_enabled) {
     "{\"category\": \"cat5\"}",
     "{\"value\": {\"gte\": 100, \"lt\": 200}}"
   };
+  const char* labels[] = {"gte0", "lt100", "cat5", "100-200"};
   const char* mode = gpu_enabled ? "GPU" : "CPU";
+  benchmark_result_t results[sizeof(queries) / sizeof(queries[0])];
+  double total_time_ms = 0;
 
   for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
-    if (!run_query_benchmark(mode, queries[i])) {
+    if (!run_query_benchmark(mode, queries[i], labels[i], &results[i])) {
       apxdb_close();
       return false;
     }
+    total_time_ms += results[i].wall_time_ms;
   }
+
+  printf("\n=== %s summary ===\n", mode);
+  printf("%-10s %10s %10s %10s %10s\n", "label", "time_ms", "hits", "path", "gpu");
+  for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); ++i) {
+    printf("%-10s %10.3f %10" PRIu64 " %10d %10d\n",
+           results[i].query,
+           results[i].wall_time_ms,
+           results[i].result_hits,
+           results[i].query_path,
+           results[i].gpu_status);
+  }
+  printf("\n%s total_time_ms = %.3f\n\n", mode, total_time_ms);
 
   bool close_ok = apxdb_close() == APXDB_OK;
   if (!close_ok) {
