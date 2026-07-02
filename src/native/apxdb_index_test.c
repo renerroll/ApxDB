@@ -280,6 +280,14 @@ static void run_test_stale_doc_ids_reject(const char* dir) {
   free(idx_path);
 }
 
+static void assert_query_result_count(const char* collection_name, const char* query, int expected_count) {
+  const char* result_json = apxdb_find_documents(collection_name, query);
+  ASSERT(result_json != NULL, "find_documents returned NULL");
+  int count = count_substring(result_json, "\"name\"");
+  apxdb_release_string(result_json);
+  ASSERT(count == expected_count, "unexpected query result count");
+}
+
 static void run_test_gpu_numeric_query_path(const char* dir) {
   cleanup_test_files(dir);
   printf("TEST: gpu_numeric_query_path\n");
@@ -327,6 +335,76 @@ static void run_test_gpu_numeric_query_path(const char* dir) {
   if (gpu_status == APXDB_GPU_METAL_ACTIVE || gpu_status == APXDB_GPU_VULKAN_ACTIVE) {
     ASSERT(metrics.cache_hits > 0, "expected GPU cache hit on second query");
   }
+
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+}
+
+static void run_test_numeric_exact_and_range_queries(const char* dir) {
+  cleanup_test_files(dir);
+  printf("TEST: numeric_exact_and_range_queries\n");
+
+  register_test_collection();
+  add_index(false);
+  ASSERT(open_db(dir), "open_db failed");
+
+  apxdb_transaction_t* txn = apxdb_begin_write_txn();
+  ASSERT(txn != NULL, "begin transaction failed");
+
+  const int values[] = {0, 1, 2, 5, 5, 5, 7, 8, 9, 10};
+  const int doc_count = sizeof(values) / sizeof(values[0]);
+  for (int i = 0; i < doc_count; ++i) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"value\": %d, \"name\": \"doc%d\"}", values[i], i);
+    const char* id = apxdb_put_document("test_collection", json);
+    ASSERT(id != NULL, "put_document failed");
+    apxdb_release_string(id);
+  }
+
+  int32_t result = apxdb_commit_write_txn(txn);
+  ASSERT(result == 0, "commit transaction failed");
+  apxdb_free_transaction(txn);
+
+  assert_query_result_count("test_collection", "{\"value\": 5}", 3);
+  assert_query_result_count("test_collection", "{\"value\": {\"gte\": 5}}", 7);
+  assert_query_result_count("test_collection", "{\"value\": {\"lt\": 3}}", 3);
+  assert_query_result_count("test_collection", "{\"value\": {\"gt\": 5}}", 4);
+  assert_query_result_count("test_collection", "{\"value\": {\"lte\": 5}}", 6);
+
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+}
+
+static void run_test_numeric_index_persistence(const char* dir) {
+  cleanup_test_files(dir);
+  printf("TEST: numeric_index_persistence\n");
+
+  register_test_collection();
+  add_index(false);
+  ASSERT(open_db(dir), "open_db failed");
+
+  apxdb_transaction_t* txn = apxdb_begin_write_txn();
+  ASSERT(txn != NULL, "begin transaction failed");
+
+  const int values[] = {1, 2, 5, 5, 10};
+  const int doc_count = sizeof(values) / sizeof(values[0]);
+  for (int i = 0; i < doc_count; ++i) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"value\": %d, \"name\": \"doc%d\"}", values[i], i);
+    const char* id = apxdb_put_document("test_collection", json);
+    ASSERT(id != NULL, "put_document failed");
+    apxdb_release_string(id);
+  }
+
+  ASSERT(apxdb_commit_write_txn(txn) == 0, "commit transaction failed");
+  apxdb_free_transaction(txn);
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+
+  register_test_collection();
+  add_index(false);
+  ASSERT(open_db(dir), "reopen_db failed");
+
+  assert_query_result_count("test_collection", "{\"value\": 5}", 2);
+  assert_query_result_count("test_collection", "{\"value\": {\"gte\": 5}}", 3);
+  assert_query_result_count("test_collection", "{\"value\": {\"lt\": 5}}", 2);
 
   ASSERT(apxdb_close() == APXDB_OK, "close failed");
 }
@@ -456,6 +534,8 @@ int main(void) {
   run_test_missing_idx_rebuild(dir);
   run_test_stale_doc_ids_reject(dir);
   run_test_gpu_numeric_query_path(dir);
+  run_test_numeric_exact_and_range_queries(dir);
+  run_test_numeric_index_persistence(dir);
   run_test_layout_invariants(dir);
   run_test_get_document_round_trip(dir);
 

@@ -22,6 +22,8 @@ typedef struct {
 
 typedef struct {
   char* key;
+  bool has_numeric_key;
+  double numeric_key;
   char** doc_ids;
   size_t doc_count;
   size_t doc_capacity;
@@ -1706,7 +1708,19 @@ static apxdb_index_entry_t* find_index_entry(apxdb_index_data_t* index, const ch
     return NULL;
   }
   for (size_t i = 0; i < index->entry_count; ++i) {
-    if (strcmp(index->entries[i].key, key) == 0) {
+    if (index->entries[i].key && strcmp(index->entries[i].key, key) == 0) {
+      return &index->entries[i];
+    }
+  }
+  return NULL;
+}
+
+static apxdb_index_entry_t* find_index_entry_by_numeric(apxdb_index_data_t* index, double numeric_key) {
+  if (!index) {
+    return NULL;
+  }
+  for (size_t i = 0; i < index->entry_count; ++i) {
+    if (index->entries[i].has_numeric_key && index->entries[i].numeric_key == numeric_key) {
       return &index->entries[i];
     }
   }
@@ -2567,7 +2581,7 @@ static bool save_collection_index_file(apxdb_collection_t* collection, const cha
     fclose(file);
     return false;
   }
-  if (!write_uint32_to_file(file, 1)) {
+  if (!write_uint32_to_file(file, 3)) {
     fclose(file);
     return false;
   }
@@ -2610,8 +2624,11 @@ static bool save_collection_index_file(apxdb_collection_t* collection, const cha
     }
     for (size_t j = 0; j < index->entry_count; ++j) {
       apxdb_index_entry_t* entry = &index->entries[j];
+      uint8_t key_kind = entry->has_numeric_key ? 1 : 0;
       uint32_t key_length = (uint32_t)strlen(entry->key);
-      if (!write_uint32_to_file(file, key_length) || !write_bytes_to_file(file, entry->key, key_length) ||
+      if (!write_uint8_to_file(file, key_kind) || !write_uint32_to_file(file, key_length) ||
+          !write_bytes_to_file(file, entry->key, key_length) ||
+          (key_kind == 1 && !write_bytes_to_file(file, &entry->numeric_key, sizeof(entry->numeric_key))) ||
           !write_uint32_to_file(file, (uint32_t)entry->doc_count)) {
         fclose(file);
         remove(temp_path);
@@ -2657,7 +2674,7 @@ static bool load_collection_index_file(apxdb_collection_t* collection, const cha
   }
 
   uint32_t version;
-  if (!read_uint32_from_file(file, &version) || (version != 1 && version != 2)) {
+  if (!read_uint32_from_file(file, &version) || (version != 1 && version != 2 && version != 3)) {
     fclose(file);
     return false;
   }
@@ -2771,6 +2788,16 @@ static bool load_collection_index_file(apxdb_collection_t* collection, const cha
     }
 
     for (uint32_t j = 0; j < entry_count; ++j) {
+      uint8_t key_kind = 0;
+      if (version >= 3) {
+        if (!read_uint8_from_file(file, &key_kind)) {
+          free_index_data(index);
+          clear_loaded_index_data(collection, loaded_index_count);
+          fclose(file);
+          return false;
+        }
+      }
+
       uint32_t key_length;
       if (!read_uint32_from_file(file, &key_length) || key_length == 0) {
         free_index_data(index);
@@ -2786,6 +2813,19 @@ static bool load_collection_index_file(apxdb_collection_t* collection, const cha
         return false;
       }
       index->entries[j].key[key_length] = '\0';
+
+      if (key_kind == 1) {
+        if (!read_bytes_from_file(file, &index->entries[j].numeric_key, sizeof(index->entries[j].numeric_key))) {
+          free_index_data(index);
+          clear_loaded_index_data(collection, loaded_index_count);
+          fclose(file);
+          return false;
+        }
+        index->entries[j].has_numeric_key = true;
+      } else {
+        index->entries[j].has_numeric_key = false;
+        index->entries[j].numeric_key = 0.0;
+      }
 
       uint32_t doc_count;
       if (!read_uint32_from_file(file, &doc_count)) {
@@ -3408,7 +3448,18 @@ static bool add_index_key(apxdb_collection_t* collection, size_t doc_index, cons
   if (!key) {
     return false;
   }
-  apxdb_index_entry_t* entry = find_index_entry(index, key);
+  double numeric_key = 0.0;
+  bool has_numeric_key = false;
+  if (blob_payload_to_double(field, payload, payload_size, &numeric_key)) {
+    has_numeric_key = true;
+  }
+  apxdb_index_entry_t* entry = NULL;
+  if (has_numeric_key) {
+    entry = find_index_entry_by_numeric(index, numeric_key);
+  }
+  if (!entry) {
+    entry = find_index_entry(index, key);
+  }
   if (!entry) {
     if (index->entry_count >= index->entry_capacity) {
       size_t next_capacity = index->entry_capacity == 0 ? 4 : index->entry_capacity * 2;
@@ -3422,14 +3473,23 @@ static bool add_index_key(apxdb_collection_t* collection, size_t doc_index, cons
     }
     apxdb_index_entry_t* new_entry = &index->entries[index->entry_count++];
     new_entry->key = key;
+    new_entry->has_numeric_key = has_numeric_key;
+    new_entry->numeric_key = numeric_key;
     new_entry->doc_ids = NULL;
     new_entry->doc_count = 0;
     new_entry->doc_capacity = 0;
     return add_doc_id_to_entry(new_entry, collection->documents[doc_index].id);
   }
-  bool ok = add_doc_id_to_entry(entry, collection->documents[doc_index].id);
-  free(key);
-  return ok;
+  if (!entry->key) {
+    entry->key = key;
+  } else {
+    free(key);
+  }
+  if (has_numeric_key && !entry->has_numeric_key) {
+    entry->has_numeric_key = true;
+    entry->numeric_key = numeric_key;
+  }
+  return add_doc_id_to_entry(entry, collection->documents[doc_index].id);
 }
 
 static const apxdb_json_value_t* json_path_get(const apxdb_json_value_t* value, const char* path) {
@@ -3861,7 +3921,9 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
 
   for (size_t i = 0; i < index->entry_count; ++i) {
     double key_value;
-    if (!parse_numeric_value((apxdb_json_value_t*)&(apxdb_json_value_t){.type = APXDB_JSON_STRING, .u.string_value = index->entries[i].key}, &key_value)) {
+    if (index->entries[i].has_numeric_key) {
+      key_value = index->entries[i].numeric_key;
+    } else if (!parse_numeric_value((apxdb_json_value_t*)&(apxdb_json_value_t){.type = APXDB_JSON_STRING, .u.string_value = index->entries[i].key}, &key_value)) {
       continue;
     }
     if (!compare_numeric_operator(key_value, op, threshold)) {
@@ -3906,6 +3968,18 @@ static char** find_docs_for_member(apxdb_collection_t* collection, const apxdb_j
         }
       }
     } else {
+      double numeric_value;
+      if (parse_numeric_value(member->value, &numeric_value)) {
+        apxdb_index_entry_t* entry = find_index_entry_by_numeric(index, numeric_value);
+        if (entry) {
+          reset_last_query_metrics();
+          update_last_query_metrics_path(APXDB_QUERY_CPU_ONLY);
+          *out_count = entry->doc_count;
+          set_last_query_metrics_result_count(*out_count);
+          set_last_query_metrics_total_ns(0);
+          return copy_doc_id_list(entry->doc_ids, entry->doc_count);
+        }
+      }
       char* key = json_value_to_string(member->value);
       if (key) {
         apxdb_index_entry_t* entry = find_index_entry(index, key);

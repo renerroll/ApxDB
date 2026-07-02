@@ -10,6 +10,11 @@
 extern "C" {
 #endif
 
+// apxdb_schema.h
+// Public schema metadata API for ApxDB native core.
+// This header defines schema-related object types and runtime
+// declarations used by other modules.
+
 typedef enum {
   APXDB_TYPE_BYTE,
   APXDB_TYPE_SHORT,
@@ -73,10 +78,12 @@ typedef struct apxdb_schema_t {
   size_t field_count;
 } apxdb_schema_t;
 
+// Schema registry API
 const apxdb_schema_t* apxdb_schema_register(const apxdb_schema_t* schema);
 const apxdb_schema_t* apxdb_schema_find(const char* collection_name);
 void apxdb_schema_unregister_all(void);
 
+// Schema helper utilities
 const apxdb_schema_field_t* apxdb_schema_find_field(const apxdb_schema_t* schema, const char* field_name);
 const apxdb_schema_field_t* apxdb_schema_find_field_path(const apxdb_schema_t* schema, const char* field_path);
 bool apxdb_schema_field_is_list(const apxdb_schema_field_t* field);

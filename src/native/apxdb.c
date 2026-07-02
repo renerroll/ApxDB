@@ -1273,6 +1273,3 @@ const char* apxdb_find_document(const char* query_utf8) {
 void apxdb_release_string(const char* utf8) {
   free((void*)utf8);
 }
-
-#include "apxdb_schema.c"
-#include "apxdb_collection.c"
