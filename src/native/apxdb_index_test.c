@@ -395,6 +395,56 @@ static void run_test_numeric_exact_and_range_queries(const char* dir) {
   ASSERT(apxdb_close() == APXDB_OK, "close failed");
 }
 
+static void run_test_query_plan_diagnostics(const char* dir) {
+  cleanup_test_files(dir);
+  printf("TEST: query_plan_diagnostics\n");
+
+  register_test_collection();
+  add_index(false);
+  ASSERT(open_db(dir), "open_db failed");
+
+  apxdb_transaction_t* txn = apxdb_begin_write_txn();
+  ASSERT(txn != NULL, "begin transaction failed");
+
+  for (int i = 0; i < 10; ++i) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"value\": %d, \"name\": \"doc%d\"}", i, i);
+    const char* id = apxdb_put_document("test_collection", json);
+    ASSERT(id != NULL, "put_document failed");
+    apxdb_release_string(id);
+  }
+
+  ASSERT(apxdb_commit_write_txn(txn) == 0, "commit transaction failed");
+  apxdb_free_transaction(txn);
+
+  const char* narrow_query = "{\"value\": {\"gte\": 8}}";
+  const char* narrow_result = apxdb_find_documents("test_collection", narrow_query);
+  ASSERT(narrow_result != NULL, "find_documents returned NULL");
+  apxdb_release_string(narrow_result);
+  ASSERT(apxdb_last_query_plan() == APXDB_QUERY_PLAN_INDEX_RANGE, "expected narrow range index plan");
+
+  apxdb_query_metrics_t metrics;
+  ASSERT(apxdb_last_query_metrics(&metrics) == 0, "failed to read last query metrics");
+  ASSERT(metrics.plan == APXDB_QUERY_PLAN_INDEX_RANGE, "metrics.plan should reflect index range");
+  ASSERT(metrics.plan_reason == APXDB_QUERY_PLAN_REASON_RANGE_NARROW, "expected range narrow plan reason");
+  ASSERT(metrics.selectivity_estimate <= 0.20 + 1e-9, "unexpected selectivity for narrow range");
+  ASSERT(metrics.range_lower == 8.0, "unexpected numeric range lower bound");
+  ASSERT(metrics.numeric_domain_min == 0.0 && metrics.numeric_domain_max == 9.0, "unexpected numeric domain bounds");
+
+  const char* wide_query = "{\"value\": {\"gte\": 5}}";
+  const char* wide_result = apxdb_find_documents("test_collection", wide_query);
+  ASSERT(wide_result != NULL, "find_documents returned NULL");
+  apxdb_release_string(wide_result);
+  ASSERT(apxdb_last_query_plan() == APXDB_QUERY_PLAN_SCAN, "expected scan plan for wide range");
+
+  ASSERT(apxdb_last_query_metrics(&metrics) == 0, "failed to read last query metrics");
+  ASSERT(metrics.plan_reason == APXDB_QUERY_PLAN_REASON_RANGE_WIDE, "expected range wide plan reason");
+  ASSERT(metrics.selectivity_estimate > 0.20, "unexpected selectivity for wide range");
+  ASSERT(metrics.range_lower == 5.0, "unexpected wide range lower bound");
+
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+}
+
 static void run_test_multi_predicate_planner(const char* dir) {
   cleanup_test_files(dir);
   printf("TEST: multi_predicate_planner\n");
@@ -667,6 +717,7 @@ int main(void) {
   run_test_stale_doc_ids_reject(dir);
   run_test_gpu_numeric_query_path(dir);
   run_test_numeric_exact_and_range_queries(dir);
+  run_test_query_plan_diagnostics(dir);
   run_test_multi_predicate_planner(dir);
   run_test_multi_predicate_exact_beats_wide_range(dir);
   run_test_multi_predicate_scan_fallback(dir);
