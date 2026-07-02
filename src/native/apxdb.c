@@ -35,7 +35,7 @@ char* g_storage_directory = NULL;
 static apxdb_document_t* g_documents = NULL;
 static size_t g_document_count = 0;
 static size_t g_document_capacity = 0;
-static atomic_int_fast32_t g_document_counter = ATOMIC_VAR_INIT(0);
+static atomic_int_fast32_t g_document_counter = 0;
 
 static char* allocate_utf8_string(const char* text) {
   if (!text) {

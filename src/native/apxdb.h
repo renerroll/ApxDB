@@ -142,9 +142,38 @@ typedef struct apxdb_collection_schema_t {
   const apxdb_index_schema_t* indexes;
 } apxdb_collection_schema_t;
 
+enum {
+  APXDB_COLLECTION_LAYOUT_VERSION_1 = 1,
+};
+
+typedef struct apxdb_collection_field_layout_t {
+  uint32_t field_id;
+  const char* name;
+  apxdb_field_type_t type;
+  uint32_t flags;
+  apxdb_storage_kind_t storage_kind;
+  uint32_t offset;
+  uint32_t size;
+  uint32_t variable_slot;
+} apxdb_collection_field_layout_t;
+
+typedef struct apxdb_collection_layout_t {
+  uint32_t struct_size;
+  uint32_t version;
+  uint32_t collection_id;
+  const char* name;
+  uint32_t field_count;
+  const apxdb_collection_field_layout_t* fields;
+  uint32_t nullable_bitmap_size;
+  uint32_t row_fixed_size;
+  uint32_t variable_slot_count;
+} apxdb_collection_layout_t;
+
 const apxdb_collection_schema_t* apxdb_register_schema(const apxdb_collection_schema_t* schema);
 const apxdb_collection_schema_t* apxdb_find_collection_schema_by_name(const char* name);
 const apxdb_collection_schema_t* apxdb_find_collection_schema_by_id(uint32_t collection_id);
+const apxdb_collection_layout_t* apxdb_find_collection_layout_by_name(const char* name);
+const apxdb_collection_layout_t* apxdb_find_collection_layout_by_id(uint32_t collection_id);
 void apxdb_unregister_all_schemas(void);
 
 int32_t apxdb_last_query_path(void);

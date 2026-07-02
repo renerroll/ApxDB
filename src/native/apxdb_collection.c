@@ -42,6 +42,7 @@ typedef struct {
 
 struct apxdb_collection_t {
   const apxdb_schema_t* schema;
+  const apxdb_collection_layout_t* layout;
   apxdb_collection_document_t* documents;
   size_t document_count;
   size_t document_capacity;
@@ -70,7 +71,7 @@ struct apxdb_transaction_t {
 static apxdb_collection_t** g_collections = NULL;
 static size_t g_collection_count = 0;
 static size_t g_collection_capacity = 0;
-static atomic_int_fast32_t g_collection_counter = ATOMIC_VAR_INIT(0);
+static atomic_int_fast32_t g_collection_counter = 0;
 static apxdb_transaction_t* g_active_transaction = NULL;
 static const size_t kGpuQueryMinDocs = 128;
 static const uint32_t kCollectionFileMagic = 0x41505843u; // 'APXC'
@@ -130,7 +131,9 @@ typedef struct {
 static bool parse_numeric_value(const apxdb_json_value_t* value, double* out_value);
 static bool compare_numeric_operator(double doc_value, const char* op, double threshold);
 static bool serialize_document_blob(const apxdb_schema_t* schema, const apxdb_json_value_t* document, uint8_t** out_blob, size_t* out_blob_size);
+static bool serialize_document_blob_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, uint8_t** out_blob, size_t* out_blob_size);
 static bool compute_document_blob_size(const apxdb_schema_t* schema, const apxdb_json_value_t* document, size_t* out_size);
+static bool compute_document_blob_size_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, size_t* out_size);
 static bool compute_field_payload_size(const apxdb_schema_field_t* field, const apxdb_json_value_t* value, size_t* out_size);
 static bool serialize_field_payload(const apxdb_schema_field_t* field, const apxdb_json_value_t* value, uint8_t* buffer, size_t buffer_size, size_t* out_written);
 static uint64_t compute_schema_signature(const apxdb_schema_t* schema);
@@ -211,6 +214,142 @@ static bool compute_document_blob_size(const apxdb_schema_t* schema, const apxdb
   }
   size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
   *out_size = header_size + total_payload;
+  return true;
+}
+
+static bool compute_document_blob_size_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, size_t* out_size) {
+  if (!layout || !schema || !document || !out_size) {
+    return false;
+  }
+  if (layout->field_count != schema->field_count) {
+    return false;
+  }
+
+  size_t variable_payload_total = 0;
+  for (uint32_t i = 0; i < schema->field_count; ++i) {
+    const apxdb_schema_field_t* field = &schema->fields[i];
+    const apxdb_collection_field_layout_t* field_layout = &layout->fields[i];
+    if (field_layout->storage_kind == APXDB_STORAGE_VARIABLE) {
+      const apxdb_json_value_t* value = apxdb_json_object_get(document, field->name);
+      if (!value) {
+        apxdb_json_value_t missing = {.type = APXDB_JSON_NULL};
+        value = &missing;
+      }
+      if (value->type != APXDB_JSON_NULL) {
+        size_t field_size = 0;
+        if (!compute_field_payload_size(field, value, &field_size)) {
+          return false;
+        }
+        variable_payload_total += field_size;
+      }
+    }
+  }
+
+  size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
+  *out_size = header_size + layout->row_fixed_size + variable_payload_total;
+  return true;
+}
+
+static bool serialize_document_blob_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, uint8_t** out_blob, size_t* out_blob_size) {
+  if (!layout || !schema || !document || !out_blob || !out_blob_size) {
+    return false;
+  }
+  if (layout->field_count != schema->field_count) {
+    return false;
+  }
+
+  size_t blob_size = 0;
+  if (!compute_document_blob_size_with_layout(layout, schema, document, &blob_size)) {
+    return false;
+  }
+
+  size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
+  uint8_t* blob = (uint8_t*)calloc(1, blob_size);
+  if (!blob) {
+    return false;
+  }
+
+  uint8_t* cursor = blob;
+  uint32_t magic = 0x41584244u; // 'AXBD'
+  uint32_t version = 1;
+  uint32_t field_count = (uint32_t)schema->field_count;
+  memcpy(cursor, &magic, sizeof(uint32_t));
+  cursor += sizeof(uint32_t);
+  memcpy(cursor, &version, sizeof(uint32_t));
+  cursor += sizeof(uint32_t);
+  memcpy(cursor, &field_count, sizeof(uint32_t));
+  cursor += sizeof(uint32_t);
+
+  uint8_t* row_body = blob + header_size;
+  uint8_t* payload_cursor = row_body + layout->row_fixed_size;
+  uint32_t nullable_bit_index = 0;
+
+  for (uint32_t i = 0; i < schema->field_count; ++i) {
+    const apxdb_schema_field_t* field = &schema->fields[i];
+    const apxdb_collection_field_layout_t* field_layout = &layout->fields[i];
+    const apxdb_json_value_t* value = apxdb_json_object_get(document, field->name);
+    if (!value) {
+      apxdb_json_value_t missing = {.type = APXDB_JSON_NULL};
+      value = &missing;
+    }
+
+    apxdb_document_field_entry_t entry = {0};
+    bool is_null = (value->type == APXDB_JSON_NULL);
+
+    if (field->nullable) {
+      if (is_null) {
+        uint32_t byte_index = nullable_bit_index / 8;
+        uint32_t bit_index = nullable_bit_index % 8;
+        row_body[byte_index] |= (uint8_t)(1u << bit_index);
+      }
+      nullable_bit_index += 1;
+    }
+
+    if (!is_null) {
+      if (field_layout->storage_kind == APXDB_STORAGE_VARIABLE) {
+        size_t written = 0;
+        if (!serialize_field_payload(field, value, payload_cursor, blob_size - (payload_cursor - blob), &written)) {
+          free(blob);
+          return false;
+        }
+        entry.offset = (uint32_t)(payload_cursor - blob);
+        entry.size = (uint32_t)written;
+        entry.is_null = 0;
+        payload_cursor += written;
+
+        uint32_t slot_offset = field_layout->offset;
+        if (slot_offset + sizeof(uint32_t) * 2 <= layout->row_fixed_size) {
+          uint32_t payload_offset_within_row = (uint32_t)(entry.offset - header_size);
+          uint32_t payload_size = entry.size;
+          memcpy(row_body + slot_offset, &payload_offset_within_row, sizeof(uint32_t));
+          memcpy(row_body + slot_offset + sizeof(uint32_t), &payload_size, sizeof(uint32_t));
+        }
+      } else {
+        size_t written = 0;
+        if (!serialize_field_payload(field, value, row_body + field_layout->offset, field_layout->size, &written)) {
+          free(blob);
+          return false;
+        }
+        if (written != field_layout->size) {
+          free(blob);
+          return false;
+        }
+        entry.offset = (uint32_t)(row_body + field_layout->offset - blob);
+        entry.size = (uint32_t)field_layout->size;
+        entry.is_null = 0;
+      }
+    } else {
+      entry.offset = 0;
+      entry.size = 0;
+      entry.is_null = 1;
+    }
+
+    memcpy(cursor, &entry, sizeof(apxdb_document_field_entry_t));
+    cursor += sizeof(apxdb_document_field_entry_t);
+  }
+
+  *out_blob = blob;
+  *out_blob_size = blob_size;
   return true;
 }
 
@@ -1355,6 +1494,7 @@ int32_t apxdb_register_collection(const apxdb_schema_t* schema) {
     return -1;
   }
   collection->schema = schema;
+  collection->layout = apxdb_find_collection_layout_by_name(schema->collection_name);
   g_collections[g_collection_count++] = collection;
   return 0;
 }
@@ -3518,10 +3658,18 @@ const char* apxdb_put_document(const char* collection_name, const char* json_utf
 
   uint8_t* blob = NULL;
   size_t blob_size = 0;
-  if (!serialize_document_blob(collection->schema, &doc_value, &blob, &blob_size)) {
-    apxdb_json_free(&doc_value);
-    free(id);
-    return NULL;
+  if (collection->layout) {
+    if (!serialize_document_blob_with_layout(collection->layout, collection->schema, &doc_value, &blob, &blob_size)) {
+      apxdb_json_free(&doc_value);
+      free(id);
+      return NULL;
+    }
+  } else {
+    if (!serialize_document_blob(collection->schema, &doc_value, &blob, &blob_size)) {
+      apxdb_json_free(&doc_value);
+      free(id);
+      return NULL;
+    }
   }
 
   if (!append_document(collection, id, json_utf8, blob, blob_size)) {
