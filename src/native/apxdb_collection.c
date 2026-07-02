@@ -1530,6 +1530,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
   apxdb_gpu_column_cache_t* cache = find_gpu_column_cache(collection, field_path);
   int32_t* values = NULL;
   uint32_t* valid_mask = NULL;
+
   bool owns_temp_buffers = false;
   uint8_t* mask = (uint8_t*)malloc(count);
   if (!mask) {
@@ -3445,6 +3446,49 @@ const char* apxdb_find_documents(const char* collection_name, const char* query_
     set_last_query_metrics_total_ns(now_ns() - query_start_ns);
   }
   return fallback;
+}
+
+int32_t apxdb_count_documents(const char* collection_name, const char* query_json) {
+  if (!collection_name) {
+    return -1;
+  }
+  apxdb_collection_t* collection = find_collection(collection_name);
+  if (!collection || !ensure_collection_loaded(collection, NULL)) {
+    return -1;
+  }
+
+  reset_last_query_metrics();
+  uint64_t query_start_ns = now_ns();
+
+  if (query_json && *query_json) {
+    apxdb_json_value_t query;
+    if (apxdb_json_parse(query_json, &query)) {
+      size_t doc_count = 0;
+      bool owned = false;
+      char** doc_ids = find_docs_by_query(collection, &query, &doc_count, &owned);
+      apxdb_json_free(&query);
+      if (doc_ids || doc_count == 0) {
+        if (owned && doc_ids) {
+          free(doc_ids);
+        }
+        if (doc_count > INT32_MAX) {
+          return -1;
+        }
+        set_last_query_metrics_result_count(doc_count);
+        set_last_query_metrics_total_ns(now_ns() - query_start_ns);
+        return (int32_t)doc_count;
+      }
+    }
+    return -1;
+  }
+
+  size_t count = collection->document_count;
+  if (count > INT32_MAX) {
+    return -1;
+  }
+  set_last_query_metrics_result_count(count);
+  set_last_query_metrics_total_ns(now_ns() - query_start_ns);
+  return (int32_t)count;
 }
 
 const char* apxdb_put_document(const char* collection_name, const char* json_utf8) {

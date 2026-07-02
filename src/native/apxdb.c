@@ -125,10 +125,17 @@ int32_t apxdb_gpu_status(void) {
   return status;
 }
 
+static bool g_gpu_force_disabled = false;
 static void cleanup_gpu_backend(void);
 static void set_state(apxdb_state_t state) {
   g_state = state;
   g_initialized = (state == APXDB_STATE_OPEN);
+}
+
+void apxdb_set_gpu_enabled(bool enabled) {
+  pthread_mutex_lock(&g_mutex);
+  g_gpu_force_disabled = !enabled;
+  pthread_mutex_unlock(&g_mutex);
 }
 
 static void set_gpu_status(apxdb_gpu_status_t status) {
@@ -181,6 +188,12 @@ static id<MTLDevice> g_metal_device = nil;
 static id<MTLCommandQueue> g_metal_command_queue = nil;
 static id<MTLLibrary> g_metal_library = nil;
 static id<MTLComputePipelineState> g_metal_pipeline = nil;
+static id<MTLComputePipelineState> g_metal_count_pipeline = nil;
+static id<MTLBuffer> g_metal_input_buffer = nil;
+static id<MTLBuffer> g_metal_valid_buffer = nil;
+static id<MTLBuffer> g_metal_output_buffer = nil;
+static id<MTLBuffer> g_metal_params_buffer = nil;
+static id<MTLBuffer> g_metal_count_buffer = nil;
 
 static const char kMetalShaderSource[] =
 "#include <metal_stdlib>\n"
@@ -205,6 +218,29 @@ static const char kMetalShaderSource[] =
 "    }\n"
 "  }\n"
 "  output[tid] = match ? 1u : 0u;\n"
+"}\n"
+"kernel void documentCount(device const int* input [[buffer(0)]],\n"
+"                          device const uint* valid [[buffer(1)]],\n"
+"                          device atomic_uint* count [[buffer(2)]],\n"
+"                          device const int* params [[buffer(3)]],\n"
+"                          uint tid [[thread_position_in_grid]]) {\n"
+"  bool match = false;\n"
+"  if (valid[tid] != 0u) {\n"
+"    int op = params[0];\n"
+"    int threshold = params[1];\n"
+"    int value = input[tid];\n"
+"    switch (op) {\n"
+"      case 0: match = (value == threshold); break;\n"
+"      case 1: match = (value > threshold); break;\n"
+"      case 2: match = (value >= threshold); break;\n"
+"      case 3: match = (value < threshold); break;\n"
+"      case 4: match = (value <= threshold); break;\n"
+"      default: match = false; break;\n"
+"    }\n"
+"  }\n"
+"  if (match) {\n"
+"    atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);\n"
+"  }\n"
 "}\n";
 
 static bool initialize_metal_backend(void) {
@@ -248,12 +284,42 @@ static bool initialize_metal_backend(void) {
     cleanup_metal_backend();
     return false;
   }
+
+  id<MTLFunction> countFunction = [g_metal_library newFunctionWithName:@"documentCount"];
+  if (!countFunction) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal count function lookup failed\n");
+#endif
+    cleanup_metal_backend();
+    return false;
+  }
+  g_metal_count_pipeline = [g_metal_device newComputePipelineStateWithFunction:countFunction error:&error];
+  if (!g_metal_count_pipeline) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal count pipeline creation failed: %s\n", [[error localizedDescription] UTF8String]);
+#endif
+    cleanup_metal_backend();
+    return false;
+  }
   return true;
+}
+
+static id<MTLBuffer> ensure_metal_buffer(id<MTLBuffer> buffer, size_t size) {
+  if (!buffer || [buffer length] < size) {
+    buffer = [g_metal_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+  }
+  return buffer;
 }
 
 static void cleanup_metal_backend(void) {
 #ifdef __OBJC__
+  g_metal_count_buffer = nil;
+  g_metal_params_buffer = nil;
+  g_metal_output_buffer = nil;
+  g_metal_valid_buffer = nil;
+  g_metal_input_buffer = nil;
   g_metal_pipeline = nil;
+  g_metal_count_pipeline = nil;
   g_metal_library = nil;
   g_metal_command_queue = nil;
   g_metal_device = nil;
@@ -698,50 +764,71 @@ bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t
   }
 
   size_t input_size = count * sizeof(int32_t);
-  id<MTLBuffer> input_buffer = [g_metal_device newBufferWithBytes:values length:input_size options:MTLResourceStorageModeShared];
-  if (!input_buffer) {
-    return false;
-  }
-
+  size_t valid_size = count * sizeof(uint32_t);
   size_t output_size = count * sizeof(uint32_t);
-  id<MTLBuffer> valid_buffer = [g_metal_device newBufferWithBytes:valid_mask length:count * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-  if (!valid_buffer) {
-    return false;
-  }
-  id<MTLBuffer> output_buffer = [g_metal_device newBufferWithLength:output_size options:MTLResourceStorageModeShared];
-  if (!output_buffer) {
+
+  g_metal_input_buffer = ensure_metal_buffer(g_metal_input_buffer, input_size);
+  g_metal_valid_buffer = ensure_metal_buffer(g_metal_valid_buffer, valid_size);
+  g_metal_output_buffer = ensure_metal_buffer(g_metal_output_buffer, output_size);
+  if (!g_metal_input_buffer || !g_metal_valid_buffer || !g_metal_output_buffer) {
     return false;
   }
 
+  memcpy([g_metal_input_buffer contents], values, input_size);
+  [g_metal_input_buffer didModifyRange:NSMakeRange(0, input_size)];
+  memcpy([g_metal_valid_buffer contents], valid_mask, valid_size);
+  [g_metal_valid_buffer didModifyRange:NSMakeRange(0, valid_size)];
   int32_t params[2] = {op, threshold};
-  id<MTLBuffer> params_buffer = [g_metal_device newBufferWithBytes:params length:sizeof(params) options:MTLResourceStorageModeShared];
-  if (!params_buffer) {
-    return false;
+  if (!g_metal_params_buffer) {
+    g_metal_params_buffer = [g_metal_device newBufferWithLength:sizeof(params) options:MTLResourceStorageModeShared];
+    if (!g_metal_params_buffer) {
+      return false;
+    }
   }
+  memcpy([g_metal_params_buffer contents], params, sizeof(params));
+  [g_metal_params_buffer didModifyRange:NSMakeRange(0, sizeof(params))];
 
   id<MTLCommandBuffer> commandBuffer = [g_metal_command_queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
   [encoder setComputePipelineState:g_metal_pipeline];
-  [encoder setBuffer:input_buffer offset:0 atIndex:0];
-  [encoder setBuffer:valid_buffer offset:0 atIndex:1];
-  [encoder setBuffer:output_buffer offset:0 atIndex:2];
-  [encoder setBuffer:params_buffer offset:0 atIndex:3];
+  [encoder setBuffer:g_metal_input_buffer offset:0 atIndex:0];
+  [encoder setBuffer:g_metal_valid_buffer offset:0 atIndex:1];
+  [encoder setBuffer:g_metal_output_buffer offset:0 atIndex:2];
+  [encoder setBuffer:g_metal_params_buffer offset:0 atIndex:3];
 
   MTLSize gridSize = MTLSizeMake(count, 1, 1);
-  NSUInteger threadGroupSize = g_metal_pipeline.maxTotalThreadsPerThreadgroup;
+  NSUInteger width = g_metal_pipeline.threadExecutionWidth;
+  NSUInteger maxThreads = g_metal_pipeline.maxTotalThreadsPerThreadgroup;
+  NSUInteger threadGroupSize = width * 4;
+  if (threadGroupSize > maxThreads) {
+    threadGroupSize = maxThreads;
+  }
   if (threadGroupSize > count) {
     threadGroupSize = count;
+  }
+  if (width > 0) {
+    threadGroupSize = (threadGroupSize / width) * width;
+    if (threadGroupSize == 0) {
+      threadGroupSize = width;
+    }
   }
   if (threadGroupSize == 0) {
     threadGroupSize = 1;
   }
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+  fprintf(stderr, "apxdb: gpu dispatch count=%zu threadExecutionWidth=%lu threadgroup=%lu maxPerGroup=%lu\n",
+          count,
+          (unsigned long)width,
+          (unsigned long)threadGroupSize,
+          (unsigned long)maxThreads);
+#endif
   MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
   [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
   [encoder endEncoding];
   [commandBuffer commit];
   [commandBuffer waitUntilCompleted];
 
-  uint32_t* gpu_results = (uint32_t*)[output_buffer contents];
+  uint32_t* gpu_results = (uint32_t*)[g_metal_output_buffer contents];
   for (size_t i = 0; i < count; ++i) {
     out_mask[i] = gpu_results[i] ? 1 : 0;
   }
@@ -758,7 +845,112 @@ bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t
 #endif
 }
 
+bool run_gpu_query_int_count(const int32_t* values, const uint32_t* valid_mask, size_t count, int op, int32_t threshold, uint32_t* out_count) {
+  if (!g_gpu_available) {
+    return false;
+  }
+#ifdef __OBJC__
+  if (!values || !valid_mask || !out_count || count == 0 || !g_metal_count_pipeline || !g_metal_command_queue) {
+    return false;
+  }
+
+  size_t input_size = count * sizeof(int32_t);
+  size_t valid_size = count * sizeof(uint32_t);
+
+  g_metal_input_buffer = ensure_metal_buffer(g_metal_input_buffer, input_size);
+  g_metal_valid_buffer = ensure_metal_buffer(g_metal_valid_buffer, valid_size);
+  g_metal_count_buffer = ensure_metal_buffer(g_metal_count_buffer, sizeof(uint32_t));
+  if (!g_metal_input_buffer || !g_metal_valid_buffer || !g_metal_count_buffer) {
+    return false;
+  }
+
+  memcpy([g_metal_input_buffer contents], values, input_size);
+  [g_metal_input_buffer didModifyRange:NSMakeRange(0, input_size)];
+  memcpy([g_metal_valid_buffer contents], valid_mask, valid_size);
+  [g_metal_valid_buffer didModifyRange:NSMakeRange(0, valid_size)];
+  uint32_t initial_count = 0;
+  memcpy([g_metal_count_buffer contents], &initial_count, sizeof(initial_count));
+  [g_metal_count_buffer didModifyRange:NSMakeRange(0, sizeof(initial_count))];
+
+  int32_t params[2] = {op, threshold};
+  if (!g_metal_params_buffer) {
+    g_metal_params_buffer = [g_metal_device newBufferWithLength:sizeof(params) options:MTLResourceStorageModeShared];
+    if (!g_metal_params_buffer) {
+      return false;
+    }
+  }
+  memcpy([g_metal_params_buffer contents], params, sizeof(params));
+  [g_metal_params_buffer didModifyRange:NSMakeRange(0, sizeof(params))];
+
+  id<MTLCommandBuffer> commandBuffer = [g_metal_command_queue commandBuffer];
+  id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+  [encoder setComputePipelineState:g_metal_count_pipeline];
+  [encoder setBuffer:g_metal_input_buffer offset:0 atIndex:0];
+  [encoder setBuffer:g_metal_valid_buffer offset:0 atIndex:1];
+  [encoder setBuffer:g_metal_count_buffer offset:0 atIndex:2];
+  [encoder setBuffer:g_metal_params_buffer offset:0 atIndex:3];
+
+  MTLSize gridSize = MTLSizeMake(count, 1, 1);
+  NSUInteger width = g_metal_count_pipeline.threadExecutionWidth;
+  NSUInteger maxThreads = g_metal_count_pipeline.maxTotalThreadsPerThreadgroup;
+  NSUInteger threadGroupSize = width * 4;
+  if (threadGroupSize > maxThreads) {
+    threadGroupSize = maxThreads;
+  }
+  if (threadGroupSize > count) {
+    threadGroupSize = count;
+  }
+  if (width > 0) {
+    threadGroupSize = (threadGroupSize / width) * width;
+    if (threadGroupSize == 0) {
+      threadGroupSize = width;
+    }
+  }
+  if (threadGroupSize == 0) {
+    threadGroupSize = 1;
+  }
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+  fprintf(stderr, "apxdb: gpu count dispatch count=%zu threadExecutionWidth=%lu threadgroup=%lu maxPerGroup=%lu\n",
+          count,
+          (unsigned long)width,
+          (unsigned long)threadGroupSize,
+          (unsigned long)maxThreads);
+#endif
+  MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
+  [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+  [encoder endEncoding];
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+
+  uint32_t* gpu_count = (uint32_t*)[g_metal_count_buffer contents];
+  *out_count = *gpu_count;
+  return true;
+#elif defined(__ANDROID__)
+  (void)values;
+  (void)valid_mask;
+  (void)count;
+  (void)op;
+  (void)threshold;
+  (void)out_count;
+  return false;
+#else
+  (void)values;
+  (void)valid_mask;
+  (void)count;
+  (void)op;
+  (void)threshold;
+  (void)out_count;
+  return false;
+#endif
+}
+
 static void init_gpu_backend(void) {
+  if (g_gpu_force_disabled) {
+    cleanup_gpu_backend();
+    g_gpu_available = false;
+    set_gpu_status(APXDB_GPU_UNAVAILABLE);
+    return;
+  }
 #ifdef __APPLE__
 #ifdef __OBJC__
   cleanup_gpu_backend();

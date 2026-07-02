@@ -38,6 +38,7 @@ void apxdb_free_transaction(apxdb_transaction_t* txn);
 
 const char* apxdb_get_document(const char* collection_name, const char* id);
 const char* apxdb_find_documents(const char* collection_name, const char* query_json);
+int32_t apxdb_count_documents(const char* collection_name, const char* query_json);
 const char* apxdb_put_document(const char* collection_name, const char* json_utf8);
 int32_t apxdb_delete_document(const char* collection_name, const char* id);
 
