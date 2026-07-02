@@ -331,6 +331,121 @@ static void run_test_gpu_numeric_query_path(const char* dir) {
   ASSERT(apxdb_close() == APXDB_OK, "close failed");
 }
 
+static void run_test_layout_invariants(const char* dir) {
+  (void)dir;
+  printf("TEST: layout_invariants\n");
+
+  static const apxdb_field_schema_t layout_fields[] = {
+    {.struct_size = sizeof(apxdb_field_schema_t), .version = 1, .field_id = 1, .name = "value", .type = APXDB_FIELD_INT64, .flags = APXDB_FIELD_FLAG_NULLABLE, .type_size = sizeof(int64_t), .storage_kind = APXDB_STORAGE_FIXED},
+    {.struct_size = sizeof(apxdb_field_schema_t), .version = 1, .field_id = 2, .name = "name", .type = APXDB_FIELD_STRING, .flags = 0, .type_size = 0, .storage_kind = APXDB_STORAGE_VARIABLE},
+    {.struct_size = sizeof(apxdb_field_schema_t), .version = 1, .field_id = 3, .name = "score", .type = APXDB_FIELD_DOUBLE, .flags = APXDB_FIELD_FLAG_NULLABLE, .type_size = sizeof(double), .storage_kind = APXDB_STORAGE_FIXED},
+  };
+
+  static const apxdb_collection_schema_t layout_schema = {
+    .struct_size = sizeof(apxdb_collection_schema_t),
+    .version = 1,
+    .collection_id = 1,
+    .name = "test_collection",
+    .field_count = 3,
+    .fields = layout_fields,
+    .index_count = 0,
+    .indexes = NULL,
+  };
+
+  const apxdb_collection_schema_t* registered = apxdb_register_schema(&layout_schema);
+  ASSERT(registered == &layout_schema, "apxdb_register_schema failed");
+
+  const apxdb_collection_layout_t* layout = apxdb_find_collection_layout_by_name("test_collection");
+  ASSERT(layout != NULL, "layout registry lookup failed");
+  ASSERT(layout->field_count == 3, "unexpected layout field count");
+  ASSERT(layout->variable_slot_count == 1, "unexpected layout variable slot count");
+  ASSERT(layout->nullable_bitmap_size == 1, "unexpected nullable bitmap size");
+  ASSERT(layout->row_fixed_size == 1 + sizeof(int64_t) + sizeof(uint32_t) * 2 + sizeof(double), "unexpected row fixed size");
+
+  for (size_t i = 0; i < layout->field_count; ++i) {
+    const apxdb_collection_field_layout_t* field = &layout->fields[i];
+    ASSERT(field->offset + field->size <= layout->row_fixed_size, "layout offset overflow");
+  }
+
+  for (size_t i = 0; i < layout->field_count; ++i) {
+    for (size_t j = i + 1; j < layout->field_count; ++j) {
+      uint32_t start_i = layout->fields[i].offset;
+      uint32_t end_i = layout->fields[i].offset + layout->fields[i].size;
+      uint32_t start_j = layout->fields[j].offset;
+      uint32_t end_j = layout->fields[j].offset + layout->fields[j].size;
+      ASSERT(end_i <= start_j || end_j <= start_i, "layout field ranges overlap");
+    }
+  }
+
+  apxdb_unregister_all_schemas();
+}
+
+static void run_test_get_document_round_trip(const char* dir) {
+  cleanup_test_files(dir);
+  printf("TEST: get_document_round_trip\n");
+
+  static const apxdb_field_schema_t layout_fields[] = {
+    {.struct_size = sizeof(apxdb_field_schema_t), .version = 1, .field_id = 1, .name = "value", .type = APXDB_FIELD_INT64, .flags = 0, .type_size = sizeof(int64_t), .storage_kind = APXDB_STORAGE_FIXED},
+    {.struct_size = sizeof(apxdb_field_schema_t), .version = 1, .field_id = 2, .name = "title", .type = APXDB_FIELD_STRING, .flags = 0, .type_size = 0, .storage_kind = APXDB_STORAGE_VARIABLE},
+    {.struct_size = sizeof(apxdb_field_schema_t), .version = 1, .field_id = 3, .name = "active", .type = APXDB_FIELD_BOOL, .flags = 0, .type_size = 1, .storage_kind = APXDB_STORAGE_FIXED},
+    {.struct_size = sizeof(apxdb_field_schema_t), .version = 1, .field_id = 4, .name = "rating", .type = APXDB_FIELD_DOUBLE, .flags = APXDB_FIELD_FLAG_NULLABLE, .type_size = sizeof(double), .storage_kind = APXDB_STORAGE_FIXED},
+    {.struct_size = sizeof(apxdb_field_schema_t), .version = 1, .field_id = 5, .name = "notes", .type = APXDB_FIELD_STRING, .flags = APXDB_FIELD_FLAG_NULLABLE, .type_size = 0, .storage_kind = APXDB_STORAGE_VARIABLE},
+  };
+
+  static const apxdb_collection_schema_t layout_schema = {
+    .struct_size = sizeof(apxdb_collection_schema_t),
+    .version = 1,
+    .collection_id = 2,
+    .name = "test_collection",
+    .field_count = 5,
+    .fields = layout_fields,
+    .index_count = 0,
+    .indexes = NULL,
+  };
+
+  const apxdb_collection_schema_t* registered = apxdb_register_schema(&layout_schema);
+  ASSERT(registered == &layout_schema, "apxdb_register_schema failed");
+
+  static const apxdb_schema_field_t collection_fields[] = {
+    {"value", APXDB_TYPE_INT, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
+    {"title", APXDB_TYPE_STRING, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
+    {"active", APXDB_TYPE_BOOL, false, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
+    {"rating", APXDB_TYPE_DOUBLE, true, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
+    {"notes", APXDB_TYPE_STRING, true, NULL, 0, NULL, APXDB_ENUM_STRATEGY_ORDINAL, NULL, 0},
+  };
+
+  static const apxdb_schema_t collection_schema = {
+    .collection_name = "test_collection",
+    .fields = collection_fields,
+    .field_count = 5,
+  };
+
+  int32_t collection_result = apxdb_register_collection(&collection_schema);
+  ASSERT(collection_result == 0, "register_collection failed");
+  ASSERT(open_db(dir), "open_db failed");
+
+  apxdb_transaction_t* txn = apxdb_begin_write_txn();
+  ASSERT(txn != NULL, "begin transaction failed");
+
+  const char* input_json = "{\"value\": 123, \"title\": \"roundtrip\", \"active\": true, \"rating\": null, \"notes\": null}";
+  const char* id = apxdb_put_document("test_collection", input_json);
+  ASSERT(id != NULL, "put_document failed");
+
+  int32_t result = apxdb_commit_write_txn(txn);
+  ASSERT(result == 0, "commit transaction failed");
+  apxdb_free_transaction(txn);
+
+  const char* output = apxdb_get_document("test_collection", id);
+  ASSERT(output != NULL, "get_document failed");
+  ASSERT(strcmp(output, "{\"value\":123,\"title\":\"roundtrip\",\"active\":true,\"rating\":null,\"notes\":null}") == 0,
+         "unexpected round-trip document");
+  apxdb_release_string(output);
+  apxdb_release_string(id);
+
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+  apxdb_unregister_all_schemas();
+}
+
 int main(void) {
   char* dir = make_temp_dir();
   ASSERT(dir != NULL, "failed to create temporary directory");
@@ -341,6 +456,8 @@ int main(void) {
   run_test_missing_idx_rebuild(dir);
   run_test_stale_doc_ids_reject(dir);
   run_test_gpu_numeric_query_path(dir);
+  run_test_layout_invariants(dir);
+  run_test_get_document_round_trip(dir);
 
   printf("All apxdb index persistence tests passed.\n");
   rmdir(dir);
