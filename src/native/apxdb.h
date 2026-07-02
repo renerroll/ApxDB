@@ -79,8 +79,11 @@ int32_t apxdb_last_query_path(void);
 uint32_t apxdb_last_query_doc_count(void);
 int32_t apxdb_last_query_metrics(apxdb_query_metrics_t* out_metrics);
 const char* apxdb_create_document(const char* json_utf8);
+const char* apxdb_create_document_bytes(const uint8_t* bytes, size_t length);
+const uint8_t* apxdb_get_document_bytes(const char* id, size_t* out_length);
 const char* apxdb_find_document(const char* query_utf8);
 void apxdb_release_string(const char* utf8);
+void apxdb_release_bytes(const uint8_t* bytes);
 
 #ifdef __cplusplus
 }

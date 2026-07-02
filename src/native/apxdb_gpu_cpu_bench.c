@@ -187,9 +187,11 @@ static bool run_benchmark(const char* dir, bool gpu_enabled) {
 }
 
 static bool run_raw_gpu_cpu_benchmark(void) {
-  const size_t count = 1 * 1024 * 1024;
+  const size_t default_count = 1 * 1024 * 1024;
   const int32_t threshold = 5000;
   const int runs = 7;
+  const char* count_env = getenv("APXDB_RAW_BENCH_COUNT");
+  const size_t count = count_env ? (size_t)strtoull(count_env, NULL, 10) : default_count;
   int32_t* values = (int32_t*)malloc(count * sizeof(int32_t));
   uint32_t* valid_mask = (uint32_t*)malloc(count * sizeof(uint32_t));
   if (!values || !valid_mask) {
