@@ -45,6 +45,12 @@ typedef enum {
   APXDB_QUERY_GPU_SKIPPED_BACKEND_UNAVAILABLE,
 } apxdb_query_path_t;
 
+typedef enum {
+  APXDB_QUERY_PLAN_SCAN = 0,
+  APXDB_QUERY_PLAN_INDEX_EXACT,
+  APXDB_QUERY_PLAN_INDEX_RANGE,
+} apxdb_query_plan_t;
+
 enum {
   APXDB_OK = 0,
   APXDB_OK_GPU_FALLBACK = 10,
@@ -179,6 +185,7 @@ const apxdb_collection_layout_t* apxdb_find_collection_layout_by_id(uint32_t col
 void apxdb_unregister_all_schemas(void);
 
 int32_t apxdb_last_query_path(void);
+int32_t apxdb_last_query_plan(void);
 uint32_t apxdb_last_query_doc_count(void);
 int32_t apxdb_last_query_metrics(apxdb_query_metrics_t* out_metrics);
 const char* apxdb_create_document(const char* json_utf8);

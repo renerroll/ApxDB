@@ -381,7 +381,13 @@ static void run_test_numeric_exact_and_range_queries(const char* dir) {
   assert_query_result_count("test_collection", "{\"value\": {\"lt\": 3}}", 3);
   assert_query_result_count("test_collection", "{\"value\": {\"gt\": 5}}", 4);
   assert_query_result_count("test_collection", "{\"value\": {\"lte\": 5}}", 6);
-  assert_query_result_count("test_collection", "{\"name\": \"doc0\"}", 1);
+
+  const char* query3 = "{\"name\": \"doc0\"}";
+  const char* result3 = apxdb_find_documents("test_collection", query3);
+  ASSERT(result3 != NULL, "find_documents returned NULL");
+  ASSERT(apxdb_last_query_plan() == APXDB_QUERY_PLAN_SCAN, "expected scan plan for non-indexed field");
+  apxdb_release_string(result3);
+  assert_query_result_count("test_collection", query3, 1);
 
   ASSERT(apxdb_close() == APXDB_OK, "close failed");
 }
