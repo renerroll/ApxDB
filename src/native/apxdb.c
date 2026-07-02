@@ -21,7 +21,9 @@
 
 typedef struct {
   char* id;
-  char* json;
+  uint8_t* data;
+  size_t length;
+  bool is_json;
 } apxdb_document_t;
 
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -33,7 +35,7 @@ char* g_storage_directory = NULL;
 static apxdb_document_t* g_documents = NULL;
 static size_t g_document_count = 0;
 static size_t g_document_capacity = 0;
-static atomic_int_fast32_t g_document_counter = ATOMIC_VAR_INIT(0);
+static atomic_int_fast32_t g_document_counter = 0;
 
 static char* allocate_utf8_string(const char* text) {
   if (!text) {
@@ -48,7 +50,7 @@ static char* allocate_utf8_string(const char* text) {
   return buffer;
 }
 
-static bool push_document(const char* id, const char* json) {
+static bool push_document(const char* id, const void* data, size_t length, bool is_json) {
   if (g_document_count >= g_document_capacity) {
     size_t new_capacity = g_document_capacity == 0 ? 8 : g_document_capacity * 2;
     apxdb_document_t* next = (apxdb_document_t*)realloc(g_documents, new_capacity * sizeof(apxdb_document_t));
@@ -60,9 +62,17 @@ static bool push_document(const char* id, const char* json) {
   }
 
   g_documents[g_document_count].id = allocate_utf8_string(id);
-  g_documents[g_document_count].json = allocate_utf8_string(json);
-  if (!g_documents[g_document_count].id || !g_documents[g_document_count].json) {
+  g_documents[g_document_count].length = length;
+  g_documents[g_document_count].is_json = is_json;
+  g_documents[g_document_count].data = (uint8_t*)malloc(length + (is_json ? 1 : 0));
+  if (!g_documents[g_document_count].id || !g_documents[g_document_count].data) {
+    free(g_documents[g_document_count].id);
+    free(g_documents[g_document_count].data);
     return false;
+  }
+  memcpy(g_documents[g_document_count].data, data, length);
+  if (is_json) {
+    g_documents[g_document_count].data[length] = '\0';
   }
 
   g_document_count += 1;
@@ -72,7 +82,7 @@ static bool push_document(const char* id, const char* json) {
 static void free_documents(void) {
   for (size_t index = 0; index < g_document_count; ++index) {
     free(g_documents[index].id);
-    free(g_documents[index].json);
+    free(g_documents[index].data);
   }
   free(g_documents);
   g_documents = NULL;
@@ -150,6 +160,7 @@ static void transition_to_closed(void) {
   free_documents();
   apxdb_collection_unregister_all();
   apxdb_schema_unregister_all();
+  apxdb_unregister_all_schemas();
   free(g_storage_directory);
   g_storage_directory = NULL;
   set_state(APXDB_STATE_CLOSED);
@@ -160,6 +171,7 @@ static void cleanup_partial_open(void) {
   free_documents();
   apxdb_collection_unregister_all();
   apxdb_schema_unregister_all();
+  apxdb_unregister_all_schemas();
   free(g_storage_directory);
   g_storage_directory = NULL;
   g_initialized = false;
@@ -188,12 +200,14 @@ static id<MTLDevice> g_metal_device = nil;
 static id<MTLCommandQueue> g_metal_command_queue = nil;
 static id<MTLLibrary> g_metal_library = nil;
 static id<MTLComputePipelineState> g_metal_pipeline = nil;
-static id<MTLComputePipelineState> g_metal_count_pipeline = nil;
+static id<MTLComputePipelineState> g_metal_count_phase1_pipeline = nil;
+static id<MTLComputePipelineState> g_metal_count_phase2_pipeline = nil;
 static id<MTLBuffer> g_metal_input_buffer = nil;
 static id<MTLBuffer> g_metal_valid_buffer = nil;
 static id<MTLBuffer> g_metal_output_buffer = nil;
 static id<MTLBuffer> g_metal_params_buffer = nil;
 static id<MTLBuffer> g_metal_count_buffer = nil;
+static id<MTLBuffer> g_metal_partial_counts_buffer = nil;
 
 static const char kMetalShaderSource[] =
 "#include <metal_stdlib>\n"
@@ -219,11 +233,13 @@ static const char kMetalShaderSource[] =
 "  }\n"
 "  output[tid] = match ? 1u : 0u;\n"
 "}\n"
-"kernel void documentCount(device const int* input [[buffer(0)]],\n"
-"                          device const uint* valid [[buffer(1)]],\n"
-"                          device atomic_uint* count [[buffer(2)]],\n"
-"                          device const int* params [[buffer(3)]],\n"
-"                          uint tid [[thread_position_in_grid]]) {\n"
+"kernel void documentCountPhase1(device const int* input [[buffer(0)]],\n"
+"                                    device const uint* valid [[buffer(1)]],\n"
+"                                    device const int* params [[buffer(2)]],\n"
+"                                    device uint* partial_counts [[buffer(3)]],\n"
+"                                    uint tid [[thread_position_in_grid]],\n"
+"                                    uint thread_idx [[thread_index_in_threadgroup]], uint group_size [[threads_per_threadgroup]]) {\n"
+"  uint group_id = tid / group_size;\n"
 "  bool match = false;\n"
 "  if (valid[tid] != 0u) {\n"
 "    int op = params[0];\n"
@@ -238,11 +254,41 @@ static const char kMetalShaderSource[] =
 "      default: match = false; break;\n"
 "    }\n"
 "  }\n"
-"  if (match) {\n"
-"    atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);\n"
+"  threadgroup uint local_counts[1024];\n"
+"  local_counts[thread_idx] = match ? 1u : 0u;\n"
+"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  uint size = group_size;\n"
+"  for (uint stride = size / 2; stride > 0; stride /= 2) {\n"
+"    if (thread_idx < stride) {\n"
+"      local_counts[thread_idx] += local_counts[thread_idx + stride];\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  }\n"
+"  if (thread_idx == 0) {\n"
+"    partial_counts[group_id] = local_counts[0];\n"
+"  }\n"
+"}\n"
+"kernel void documentCountPhase2(device const uint* partial_counts [[buffer(0)]],\n"
+"                                    device atomic_uint* count [[buffer(1)]],\n"
+"                                    uint tid [[thread_position_in_grid]],\n"
+"                                    uint thread_idx [[thread_index_in_threadgroup]], uint group_size [[threads_per_threadgroup]]) {\n"
+"  threadgroup uint local_counts[1024];\n"
+"  local_counts[thread_idx] = partial_counts[tid];\n"
+"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  uint size = group_size;\n"
+"  for (uint stride = size / 2; stride > 0; stride /= 2) {\n"
+"    if (thread_idx < stride) {\n"
+"      local_counts[thread_idx] += local_counts[thread_idx + stride];\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  }\n"
+"  if (thread_idx == 0) {\n"
+"    uint partial = local_counts[0];\n"
+"    if (partial > 0u) {\n"
+"      atomic_fetch_add_explicit(count, partial, memory_order_relaxed);\n"
+"    }\n"
 "  }\n"
 "}\n";
-
 static bool initialize_metal_backend(void) {
   g_metal_device = MTLCreateSystemDefaultDevice();
   if (!g_metal_device) {
@@ -285,18 +331,35 @@ static bool initialize_metal_backend(void) {
     return false;
   }
 
-  id<MTLFunction> countFunction = [g_metal_library newFunctionWithName:@"documentCount"];
-  if (!countFunction) {
+  id<MTLFunction> countPhase1Function = [g_metal_library newFunctionWithName:@"documentCountPhase1"];
+  if (!countPhase1Function) {
 #if defined(APXDB_ENABLE_DIAGNOSTICS)
-    fprintf(stderr, "apxdb: Metal count function lookup failed\n");
+    fprintf(stderr, "apxdb: Metal count phase1 function lookup failed\n");
 #endif
     cleanup_metal_backend();
     return false;
   }
-  g_metal_count_pipeline = [g_metal_device newComputePipelineStateWithFunction:countFunction error:&error];
-  if (!g_metal_count_pipeline) {
+  g_metal_count_phase1_pipeline = [g_metal_device newComputePipelineStateWithFunction:countPhase1Function error:&error];
+  if (!g_metal_count_phase1_pipeline) {
 #if defined(APXDB_ENABLE_DIAGNOSTICS)
-    fprintf(stderr, "apxdb: Metal count pipeline creation failed: %s\n", [[error localizedDescription] UTF8String]);
+    fprintf(stderr, "apxdb: Metal count phase1 pipeline creation failed: %s\n", [[error localizedDescription] UTF8String]);
+#endif
+    cleanup_metal_backend();
+    return false;
+  }
+
+  id<MTLFunction> countPhase2Function = [g_metal_library newFunctionWithName:@"documentCountPhase2"];
+  if (!countPhase2Function) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal count phase2 function lookup failed\n");
+#endif
+    cleanup_metal_backend();
+    return false;
+  }
+  g_metal_count_phase2_pipeline = [g_metal_device newComputePipelineStateWithFunction:countPhase2Function error:&error];
+  if (!g_metal_count_phase2_pipeline) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+    fprintf(stderr, "apxdb: Metal count phase2 pipeline creation failed: %s\n", [[error localizedDescription] UTF8String]);
 #endif
     cleanup_metal_backend();
     return false;
@@ -311,15 +374,46 @@ static id<MTLBuffer> ensure_metal_buffer(id<MTLBuffer> buffer, size_t size) {
   return buffer;
 }
 
+#ifdef __OBJC__
+static NSUInteger metal_threadgroup_size(NSUInteger width, NSUInteger maxThreads, NSUInteger count, const char* env_name) {
+  NSUInteger threadGroupSize = width * 4;
+  const char* env_value = getenv(env_name);
+  if (env_value) {
+    unsigned long long override_value = strtoull(env_value, NULL, 10);
+    if (override_value > 0) {
+      threadGroupSize = (NSUInteger)override_value;
+    }
+  }
+  if (threadGroupSize > maxThreads) {
+    threadGroupSize = maxThreads;
+  }
+  if (threadGroupSize > count) {
+    threadGroupSize = count;
+  }
+  if (width > 0) {
+    threadGroupSize = (threadGroupSize / width) * width;
+    if (threadGroupSize == 0) {
+      threadGroupSize = width;
+    }
+  }
+  if (threadGroupSize == 0) {
+    threadGroupSize = 1;
+  }
+  return threadGroupSize;
+}
+#endif
+
 static void cleanup_metal_backend(void) {
 #ifdef __OBJC__
   g_metal_count_buffer = nil;
+  g_metal_partial_counts_buffer = nil;
   g_metal_params_buffer = nil;
   g_metal_output_buffer = nil;
   g_metal_valid_buffer = nil;
   g_metal_input_buffer = nil;
   g_metal_pipeline = nil;
-  g_metal_count_pipeline = nil;
+  g_metal_count_phase1_pipeline = nil;
+  g_metal_count_phase2_pipeline = nil;
   g_metal_library = nil;
   g_metal_command_queue = nil;
   g_metal_device = nil;
@@ -799,28 +893,14 @@ bool run_gpu_query_int(const int32_t* values, const uint32_t* valid_mask, size_t
   MTLSize gridSize = MTLSizeMake(count, 1, 1);
   NSUInteger width = g_metal_pipeline.threadExecutionWidth;
   NSUInteger maxThreads = g_metal_pipeline.maxTotalThreadsPerThreadgroup;
-  NSUInteger threadGroupSize = width * 4;
-  if (threadGroupSize > maxThreads) {
-    threadGroupSize = maxThreads;
-  }
-  if (threadGroupSize > count) {
-    threadGroupSize = count;
-  }
-  if (width > 0) {
-    threadGroupSize = (threadGroupSize / width) * width;
-    if (threadGroupSize == 0) {
-      threadGroupSize = width;
-    }
-  }
-  if (threadGroupSize == 0) {
-    threadGroupSize = 1;
-  }
+  NSUInteger threadGroupSize = metal_threadgroup_size(width, maxThreads, count, "APXDB_METAL_THREADGROUP_SIZE");
 #if defined(APXDB_ENABLE_DIAGNOSTICS)
-  fprintf(stderr, "apxdb: gpu dispatch count=%zu threadExecutionWidth=%lu threadgroup=%lu maxPerGroup=%lu\n",
+  fprintf(stderr, "apxdb: gpu dispatch count=%zu threadExecutionWidth=%lu threadgroup=%lu maxPerGroup=%lu env=%s\n",
           count,
           (unsigned long)width,
           (unsigned long)threadGroupSize,
-          (unsigned long)maxThreads);
+          (unsigned long)maxThreads,
+          getenv("APXDB_METAL_THREADGROUP_SIZE") ?: "default");
 #endif
   MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
   [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
@@ -850,7 +930,7 @@ bool run_gpu_query_int_count(const int32_t* values, const uint32_t* valid_mask, 
     return false;
   }
 #ifdef __OBJC__
-  if (!values || !valid_mask || !out_count || count == 0 || !g_metal_count_pipeline || !g_metal_command_queue) {
+  if (!values || !valid_mask || !out_count || count == 0 || !g_metal_count_phase1_pipeline || !g_metal_count_phase2_pipeline || !g_metal_command_queue) {
     return false;
   }
 
@@ -882,42 +962,45 @@ bool run_gpu_query_int_count(const int32_t* values, const uint32_t* valid_mask, 
   memcpy([g_metal_params_buffer contents], params, sizeof(params));
   [g_metal_params_buffer didModifyRange:NSMakeRange(0, sizeof(params))];
 
+  NSUInteger width1 = g_metal_count_phase1_pipeline.threadExecutionWidth;
+  NSUInteger maxThreads1 = g_metal_count_phase1_pipeline.maxTotalThreadsPerThreadgroup;
+  NSUInteger threadGroupSize1 = metal_threadgroup_size(width1, maxThreads1, count, "APXDB_METAL_THREADGROUP1");
+
+  size_t partial_count = (count + threadGroupSize1 - 1) / threadGroupSize1;
+  size_t partial_size = partial_count * sizeof(uint32_t);
+  g_metal_partial_counts_buffer = ensure_metal_buffer(g_metal_partial_counts_buffer, partial_size);
+  if (!g_metal_partial_counts_buffer) {
+    return false;
+  }
+
+  memset([g_metal_partial_counts_buffer contents], 0, partial_size);
+  [g_metal_partial_counts_buffer didModifyRange:NSMakeRange(0, partial_size)];
+
+  NSUInteger width2 = g_metal_count_phase2_pipeline.threadExecutionWidth;
+  NSUInteger maxThreads2 = g_metal_count_phase2_pipeline.maxTotalThreadsPerThreadgroup;
+  NSUInteger threadGroupSize2 = metal_threadgroup_size(width2, maxThreads2, partial_count, "APXDB_METAL_THREADGROUP2");
+
   id<MTLCommandBuffer> commandBuffer = [g_metal_command_queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-  [encoder setComputePipelineState:g_metal_count_pipeline];
+
+  [encoder setComputePipelineState:g_metal_count_phase1_pipeline];
   [encoder setBuffer:g_metal_input_buffer offset:0 atIndex:0];
   [encoder setBuffer:g_metal_valid_buffer offset:0 atIndex:1];
-  [encoder setBuffer:g_metal_count_buffer offset:0 atIndex:2];
-  [encoder setBuffer:g_metal_params_buffer offset:0 atIndex:3];
+  [encoder setBuffer:g_metal_params_buffer offset:0 atIndex:2];
+  [encoder setBuffer:g_metal_partial_counts_buffer offset:0 atIndex:3];
 
-  MTLSize gridSize = MTLSizeMake(count, 1, 1);
-  NSUInteger width = g_metal_count_pipeline.threadExecutionWidth;
-  NSUInteger maxThreads = g_metal_count_pipeline.maxTotalThreadsPerThreadgroup;
-  NSUInteger threadGroupSize = width * 4;
-  if (threadGroupSize > maxThreads) {
-    threadGroupSize = maxThreads;
-  }
-  if (threadGroupSize > count) {
-    threadGroupSize = count;
-  }
-  if (width > 0) {
-    threadGroupSize = (threadGroupSize / width) * width;
-    if (threadGroupSize == 0) {
-      threadGroupSize = width;
-    }
-  }
-  if (threadGroupSize == 0) {
-    threadGroupSize = 1;
-  }
-#if defined(APXDB_ENABLE_DIAGNOSTICS)
-  fprintf(stderr, "apxdb: gpu count dispatch count=%zu threadExecutionWidth=%lu threadgroup=%lu maxPerGroup=%lu\n",
-          count,
-          (unsigned long)width,
-          (unsigned long)threadGroupSize,
-          (unsigned long)maxThreads);
-#endif
-  MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
-  [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+  MTLSize gridSize1 = MTLSizeMake(count, 1, 1);
+  MTLSize threadgroupSize1 = MTLSizeMake(threadGroupSize1, 1, 1);
+  [encoder dispatchThreads:gridSize1 threadsPerThreadgroup:threadgroupSize1];
+
+  [encoder setComputePipelineState:g_metal_count_phase2_pipeline];
+  [encoder setBuffer:g_metal_partial_counts_buffer offset:0 atIndex:0];
+  [encoder setBuffer:g_metal_count_buffer offset:0 atIndex:1];
+
+  MTLSize gridSize2 = MTLSizeMake(partial_count, 1, 1);
+  MTLSize threadgroupSize2 = MTLSizeMake(threadGroupSize2, 1, 1);
+  [encoder dispatchThreads:gridSize2 threadsPerThreadgroup:threadgroupSize2];
+
   [encoder endEncoding];
   [commandBuffer commit];
   [commandBuffer waitUntilCompleted];
@@ -1087,13 +1170,72 @@ const char* apxdb_create_document(const char* json_utf8) {
   char id_string[32];
   snprintf(id_string, sizeof(id_string), "doc_%d", next_id);
 
-  if (!push_document(id_string, json_utf8)) {
+  if (!push_document(id_string, json_utf8, strlen(json_utf8), true)) {
     pthread_mutex_unlock(&g_mutex);
     return allocate_utf8_string("error:allocation_failed");
   }
 
   pthread_mutex_unlock(&g_mutex);
   return allocate_utf8_string(id_string);
+}
+
+const char* apxdb_create_document_bytes(const uint8_t* bytes, size_t length) {
+  if (!bytes || length == 0) {
+    return allocate_utf8_string("error:invalid_input");
+  }
+
+  pthread_mutex_lock(&g_mutex);
+  if (g_state != APXDB_STATE_OPEN) {
+    pthread_mutex_unlock(&g_mutex);
+    return allocate_utf8_string("error:uninitialized");
+  }
+
+  int32_t next_id = atomic_fetch_add(&g_document_counter, 1) + 1;
+  char id_string[32];
+  snprintf(id_string, sizeof(id_string), "doc_%d", next_id);
+
+  if (!push_document(id_string, bytes, length, false)) {
+    pthread_mutex_unlock(&g_mutex);
+    return allocate_utf8_string("error:allocation_failed");
+  }
+
+  pthread_mutex_unlock(&g_mutex);
+  return allocate_utf8_string(id_string);
+}
+
+const uint8_t* apxdb_get_document_bytes(const char* id, size_t* out_length) {
+  if (!id || !out_length) {
+    return NULL;
+  }
+
+  pthread_mutex_lock(&g_mutex);
+  if (g_state != APXDB_STATE_OPEN) {
+    pthread_mutex_unlock(&g_mutex);
+    return NULL;
+  }
+
+  const uint8_t* result_data = NULL;
+  size_t result_length = 0;
+  for (size_t index = 0; index < g_document_count; ++index) {
+    if (strcmp(g_documents[index].id, id) == 0) {
+      result_length = g_documents[index].length;
+      result_data = (const uint8_t*)malloc(result_length);
+      if (result_data) {
+        memcpy((void*)result_data, g_documents[index].data, result_length);
+      }
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&g_mutex);
+  if (result_data) {
+    *out_length = result_length;
+  }
+  return result_data;
+}
+
+void apxdb_release_bytes(const uint8_t* bytes) {
+  free((void*)bytes);
 }
 
 const char* apxdb_find_document(const char* query_utf8) {
@@ -1109,8 +1251,16 @@ const char* apxdb_find_document(const char* query_utf8) {
 
   const char* result = "not_found";
   for (size_t index = 0; index < g_document_count; ++index) {
-    if (strcmp(g_documents[index].id, query_utf8) == 0 || strstr(g_documents[index].json, query_utf8) != NULL) {
-      result = g_documents[index].json;
+    if (strcmp(g_documents[index].id, query_utf8) == 0) {
+      if (g_documents[index].is_json) {
+        result = (const char*)g_documents[index].data;
+      } else {
+        result = "binary_document";
+      }
+      break;
+    }
+    if (g_documents[index].is_json && strstr((const char*)g_documents[index].data, query_utf8) != NULL) {
+      result = (const char*)g_documents[index].data;
       break;
     }
   }
@@ -1123,6 +1273,3 @@ const char* apxdb_find_document(const char* query_utf8) {
 void apxdb_release_string(const char* utf8) {
   free((void*)utf8);
 }
-
-#include "apxdb_schema.c"
-#include "apxdb_collection.c"

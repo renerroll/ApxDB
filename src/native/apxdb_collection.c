@@ -22,6 +22,8 @@ typedef struct {
 
 typedef struct {
   char* key;
+  bool has_numeric_key;
+  double numeric_key;
   char** doc_ids;
   size_t doc_count;
   size_t doc_capacity;
@@ -42,6 +44,7 @@ typedef struct {
 
 struct apxdb_collection_t {
   const apxdb_schema_t* schema;
+  const apxdb_collection_layout_t* layout;
   apxdb_collection_document_t* documents;
   size_t document_count;
   size_t document_capacity;
@@ -70,7 +73,7 @@ struct apxdb_transaction_t {
 static apxdb_collection_t** g_collections = NULL;
 static size_t g_collection_count = 0;
 static size_t g_collection_capacity = 0;
-static atomic_int_fast32_t g_collection_counter = ATOMIC_VAR_INIT(0);
+static atomic_int_fast32_t g_collection_counter = 0;
 static apxdb_transaction_t* g_active_transaction = NULL;
 static const size_t kGpuQueryMinDocs = 128;
 static const uint32_t kCollectionFileMagic = 0x41505843u; // 'APXC'
@@ -78,6 +81,7 @@ static const uint32_t kCollectionFileMagic = 0x41505843u; // 'APXC'
 #if defined(APXDB_ENABLE_DIAGNOSTICS)
 static pthread_mutex_t g_query_diagnostics_mutex = PTHREAD_MUTEX_INITIALIZER;
 static apxdb_query_path_t g_last_query_path = APXDB_QUERY_CPU_ONLY;
+static apxdb_query_plan_t g_last_query_plan = APXDB_QUERY_PLAN_SCAN;
 static uint32_t g_last_query_doc_count = 0;
 #endif
 static const uint32_t kCollectionFileVersion = 2;
@@ -130,7 +134,22 @@ typedef struct {
 static bool parse_numeric_value(const apxdb_json_value_t* value, double* out_value);
 static bool compare_numeric_operator(double doc_value, const char* op, double threshold);
 static bool serialize_document_blob(const apxdb_schema_t* schema, const apxdb_json_value_t* document, uint8_t** out_blob, size_t* out_blob_size);
+static apxdb_query_plan_t determine_query_plan(apxdb_collection_t* collection, const apxdb_json_member_t* member, apxdb_index_data_t** out_index);
+static void set_last_query_plan(apxdb_query_plan_t plan);
+static bool serialize_document_blob_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, uint8_t** out_blob, size_t* out_blob_size);
 static bool compute_document_blob_size(const apxdb_schema_t* schema, const apxdb_json_value_t* document, size_t* out_size);
+static bool compute_document_blob_size_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, size_t* out_size);
+static bool get_blob_field_payload_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const uint8_t* blob, size_t blob_size, const char* path, const apxdb_schema_field_t** out_field, const uint8_t** out_payload, size_t* out_payload_size);
+static bool get_collection_blob_field_payload(const apxdb_collection_t* collection, const uint8_t* blob, size_t blob_size, const char* path, const apxdb_schema_field_t** out_field, const uint8_t** out_payload, size_t* out_payload_size);
+static char* build_document_json_from_blob(const apxdb_collection_t* collection, const uint8_t* blob, size_t blob_size);
+static bool append_json_escaped_string(char** buffer, size_t* capacity, size_t* length, const char* text, size_t text_len);
+static bool append_json_string(char** buffer, size_t* capacity, size_t* length, const char* text);
+static bool append_json_raw(char** buffer, size_t* capacity, size_t* length, const char* text, size_t text_len);
+static bool append_json_uint64(char** buffer, size_t* capacity, size_t* length, uint64_t value);
+static bool append_json_double(char** buffer, size_t* capacity, size_t* length, double value);
+static bool append_json_from_payload(const apxdb_schema_field_t* field, const uint8_t* payload, size_t payload_size, char** buffer, size_t* capacity, size_t* length);
+static bool append_json_object_from_blob(const apxdb_schema_t* schema, const uint8_t* blob, size_t blob_size, char** buffer, size_t* capacity, size_t* length);
+static char* blob_value_to_string(const apxdb_schema_field_t* field, const uint8_t* payload, size_t payload_size);
 static bool compute_field_payload_size(const apxdb_schema_field_t* field, const apxdb_json_value_t* value, size_t* out_size);
 static bool serialize_field_payload(const apxdb_schema_field_t* field, const apxdb_json_value_t* value, uint8_t* buffer, size_t buffer_size, size_t* out_written);
 static uint64_t compute_schema_signature(const apxdb_schema_t* schema);
@@ -211,6 +230,142 @@ static bool compute_document_blob_size(const apxdb_schema_t* schema, const apxdb
   }
   size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
   *out_size = header_size + total_payload;
+  return true;
+}
+
+static bool compute_document_blob_size_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, size_t* out_size) {
+  if (!layout || !schema || !document || !out_size) {
+    return false;
+  }
+  if (layout->field_count != schema->field_count) {
+    return false;
+  }
+
+  size_t variable_payload_total = 0;
+  for (uint32_t i = 0; i < schema->field_count; ++i) {
+    const apxdb_schema_field_t* field = &schema->fields[i];
+    const apxdb_collection_field_layout_t* field_layout = &layout->fields[i];
+    if (field_layout->storage_kind == APXDB_STORAGE_VARIABLE) {
+      const apxdb_json_value_t* value = apxdb_json_object_get(document, field->name);
+      if (!value) {
+        apxdb_json_value_t missing = {.type = APXDB_JSON_NULL};
+        value = &missing;
+      }
+      if (value->type != APXDB_JSON_NULL) {
+        size_t field_size = 0;
+        if (!compute_field_payload_size(field, value, &field_size)) {
+          return false;
+        }
+        variable_payload_total += field_size;
+      }
+    }
+  }
+
+  size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
+  *out_size = header_size + layout->row_fixed_size + variable_payload_total;
+  return true;
+}
+
+static bool serialize_document_blob_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, uint8_t** out_blob, size_t* out_blob_size) {
+  if (!layout || !schema || !document || !out_blob || !out_blob_size) {
+    return false;
+  }
+  if (layout->field_count != schema->field_count) {
+    return false;
+  }
+
+  size_t blob_size = 0;
+  if (!compute_document_blob_size_with_layout(layout, schema, document, &blob_size)) {
+    return false;
+  }
+
+  size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
+  uint8_t* blob = (uint8_t*)calloc(1, blob_size);
+  if (!blob) {
+    return false;
+  }
+
+  uint8_t* cursor = blob;
+  uint32_t magic = 0x41584244u; // 'AXBD'
+  uint32_t version = 1;
+  uint32_t field_count = (uint32_t)schema->field_count;
+  memcpy(cursor, &magic, sizeof(uint32_t));
+  cursor += sizeof(uint32_t);
+  memcpy(cursor, &version, sizeof(uint32_t));
+  cursor += sizeof(uint32_t);
+  memcpy(cursor, &field_count, sizeof(uint32_t));
+  cursor += sizeof(uint32_t);
+
+  uint8_t* row_body = blob + header_size;
+  uint8_t* payload_cursor = row_body + layout->row_fixed_size;
+  uint32_t nullable_bit_index = 0;
+
+  for (uint32_t i = 0; i < schema->field_count; ++i) {
+    const apxdb_schema_field_t* field = &schema->fields[i];
+    const apxdb_collection_field_layout_t* field_layout = &layout->fields[i];
+    const apxdb_json_value_t* value = apxdb_json_object_get(document, field->name);
+    if (!value) {
+      apxdb_json_value_t missing = {.type = APXDB_JSON_NULL};
+      value = &missing;
+    }
+
+    apxdb_document_field_entry_t entry = {0};
+    bool is_null = (value->type == APXDB_JSON_NULL);
+
+    if (field->nullable) {
+      if (is_null) {
+        uint32_t byte_index = nullable_bit_index / 8;
+        uint32_t bit_index = nullable_bit_index % 8;
+        row_body[byte_index] |= (uint8_t)(1u << bit_index);
+      }
+      nullable_bit_index += 1;
+    }
+
+    if (!is_null) {
+      if (field_layout->storage_kind == APXDB_STORAGE_VARIABLE) {
+        size_t written = 0;
+        if (!serialize_field_payload(field, value, payload_cursor, blob_size - (payload_cursor - blob), &written)) {
+          free(blob);
+          return false;
+        }
+        entry.offset = (uint32_t)(payload_cursor - blob);
+        entry.size = (uint32_t)written;
+        entry.is_null = 0;
+        payload_cursor += written;
+
+        uint32_t slot_offset = field_layout->offset;
+        if (slot_offset + sizeof(uint32_t) * 2 <= layout->row_fixed_size) {
+          uint32_t payload_offset_within_row = (uint32_t)(entry.offset - header_size);
+          uint32_t payload_size = entry.size;
+          memcpy(row_body + slot_offset, &payload_offset_within_row, sizeof(uint32_t));
+          memcpy(row_body + slot_offset + sizeof(uint32_t), &payload_size, sizeof(uint32_t));
+        }
+      } else {
+        size_t written = 0;
+        if (!serialize_field_payload(field, value, row_body + field_layout->offset, field_layout->size, &written)) {
+          free(blob);
+          return false;
+        }
+        if (written != field_layout->size) {
+          free(blob);
+          return false;
+        }
+        entry.offset = (uint32_t)(row_body + field_layout->offset - blob);
+        entry.size = (uint32_t)field_layout->size;
+        entry.is_null = 0;
+      }
+    } else {
+      entry.offset = 0;
+      entry.size = 0;
+      entry.is_null = 1;
+    }
+
+    memcpy(cursor, &entry, sizeof(apxdb_document_field_entry_t));
+    cursor += sizeof(apxdb_document_field_entry_t);
+  }
+
+  *out_blob = blob;
+  *out_blob_size = blob_size;
   return true;
 }
 
@@ -672,6 +827,446 @@ static bool get_blob_field_payload(const apxdb_schema_t* schema, const uint8_t* 
   return false;
 }
 
+static bool get_blob_field_payload_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const uint8_t* blob, size_t blob_size, const char* path, const apxdb_schema_field_t** out_field, const uint8_t** out_payload, size_t* out_payload_size) {
+  if (!layout || !schema || !blob || !path || !out_field || !out_payload || !out_payload_size) {
+    return false;
+  }
+  size_t field_index;
+  if (strchr(path, '.') != NULL) {
+    return false;
+  }
+  if (!get_schema_field_index(schema, path, &field_index)) {
+    return false;
+  }
+  if (field_index >= layout->field_count) {
+    return false;
+  }
+
+  const apxdb_collection_field_layout_t* field_layout = &layout->fields[field_index];
+  const apxdb_schema_field_t* field = &schema->fields[field_index];
+  size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
+  if (blob_size < header_size + layout->row_fixed_size) {
+    return false;
+  }
+
+  const uint8_t* row_body = blob + header_size;
+  bool is_null = false;
+  if (field->nullable) {
+    uint32_t nullable_bit_index = 0;
+    for (size_t i = 0; i < field_index; ++i) {
+      if (schema->fields[i].nullable) {
+        nullable_bit_index += 1;
+      }
+    }
+    uint32_t byte_index = nullable_bit_index / 8;
+    uint32_t bit_index = nullable_bit_index % 8;
+    if (byte_index >= layout->nullable_bitmap_size) {
+      return false;
+    }
+    is_null = (row_body[byte_index] & (uint8_t)(1u << bit_index)) != 0;
+    if (is_null) {
+      return false;
+    }
+  }
+
+  if (field_layout->storage_kind == APXDB_STORAGE_VARIABLE) {
+    if (field_layout->offset + sizeof(uint32_t) * 2 > layout->row_fixed_size) {
+      return false;
+    }
+    const uint32_t* slot = (const uint32_t*)(row_body + field_layout->offset);
+    uint32_t payload_offset = slot[0];
+    uint32_t payload_size = slot[1];
+    if (payload_size == 0) {
+      return false;
+    }
+    if (payload_offset + payload_size > blob_size - header_size) {
+      return false;
+    }
+    *out_field = field;
+    *out_payload = row_body + payload_offset;
+    *out_payload_size = payload_size;
+    return true;
+  }
+
+  if (field_layout->offset + field_layout->size > layout->row_fixed_size) {
+    return false;
+  }
+
+  *out_field = field;
+  *out_payload = row_body + field_layout->offset;
+  *out_payload_size = field_layout->size;
+  return true;
+}
+
+static bool get_collection_blob_field_payload(const apxdb_collection_t* collection, const uint8_t* blob, size_t blob_size, const char* path, const apxdb_schema_field_t** out_field, const uint8_t** out_payload, size_t* out_payload_size) {
+  if (!collection || !path || !out_field || !out_payload || !out_payload_size) {
+    return false;
+  }
+  if (collection->layout) {
+    if (get_blob_field_payload_with_layout(collection->layout, collection->schema, blob, blob_size, path, out_field, out_payload, out_payload_size)) {
+      return true;
+    }
+  }
+  return get_blob_field_payload(collection->schema, blob, blob_size, path, out_field, out_payload, out_payload_size);
+}
+
+static bool append_json_raw(char** buffer, size_t* capacity, size_t* length, const char* text, size_t text_len) {
+  if (!buffer || !capacity || !length || !text) {
+    return false;
+  }
+  size_t required = *length + text_len + 1;
+  if (*capacity < required) {
+    size_t next = *capacity == 0 ? 256 : *capacity;
+    while (next < required) next *= 2;
+    char* next_buffer = (char*)realloc(*buffer, next);
+    if (!next_buffer) {
+      return false;
+    }
+    *buffer = next_buffer;
+    *capacity = next;
+  }
+  memcpy(*buffer + *length, text, text_len);
+  *length += text_len;
+  (*buffer)[*length] = '\0';
+  return true;
+}
+
+static bool append_json_string(char** buffer, size_t* capacity, size_t* length, const char* text) {
+  if (!buffer || !capacity || !length || !text) {
+    return false;
+  }
+  if (!append_json_raw(buffer, capacity, length, "\"", 1)) {
+    return false;
+  }
+  size_t text_len = strlen(text);
+  for (size_t i = 0; i < text_len; ++i) {
+    char c = text[i];
+    switch (c) {
+      case '"': if (!append_json_raw(buffer, capacity, length, "\\\"", 2)) return false; break;
+      case '\\': if (!append_json_raw(buffer, capacity, length, "\\\\", 2)) return false; break;
+      case '\b': if (!append_json_raw(buffer, capacity, length, "\\b", 2)) return false; break;
+      case '\f': if (!append_json_raw(buffer, capacity, length, "\\f", 2)) return false; break;
+      case '\n': if (!append_json_raw(buffer, capacity, length, "\\n", 2)) return false; break;
+      case '\r': if (!append_json_raw(buffer, capacity, length, "\\r", 2)) return false; break;
+      case '\t': if (!append_json_raw(buffer, capacity, length, "\\t", 2)) return false; break;
+      default:
+        if ((unsigned char)c < 0x20) {
+          char escaped[7];
+          snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned char)c);
+          if (!append_json_raw(buffer, capacity, length, escaped, strlen(escaped))) return false;
+        } else {
+          if (!append_json_raw(buffer, capacity, length, &c, 1)) return false;
+        }
+        break;
+    }
+  }
+  return append_json_raw(buffer, capacity, length, "\"", 1);
+}
+
+static bool append_json_uint64(char** buffer, size_t* capacity, size_t* length, uint64_t value) {
+  char temp[32];
+  int written = snprintf(temp, sizeof(temp), "%llu", (unsigned long long)value);
+  if (written < 0) {
+    return false;
+  }
+  return append_json_raw(buffer, capacity, length, temp, (size_t)written);
+}
+
+static bool append_json_double(char** buffer, size_t* capacity, size_t* length, double value) {
+  char temp[64];
+  int written = snprintf(temp, sizeof(temp), "%.*g", 17, value);
+  if (written < 0) {
+    return false;
+  }
+  return append_json_raw(buffer, capacity, length, temp, (size_t)written);
+}
+
+static bool append_json_object_from_blob(const apxdb_schema_t* schema, const uint8_t* blob, size_t blob_size, char** buffer, size_t* capacity, size_t* length) {
+  if (!schema || !blob || !buffer || !capacity || !length) {
+    return false;
+  }
+  if (!append_json_raw(buffer, capacity, length, "{", 1)) {
+    return false;
+  }
+
+  bool first = true;
+  for (size_t i = 0; i < schema->field_count; ++i) {
+    const apxdb_schema_field_t* field = &schema->fields[i];
+    const apxdb_document_field_entry_t* entry = get_blob_field_entry(blob, blob_size, i);
+    if (!entry) {
+      return false;
+    }
+    if (!first && !append_json_raw(buffer, capacity, length, ",", 1)) {
+      return false;
+    }
+    first = false;
+    if (!append_json_string(buffer, capacity, length, field->name)) {
+      return false;
+    }
+    if (!append_json_raw(buffer, capacity, length, ":", 1)) {
+      return false;
+    }
+    if (entry->is_null) {
+      if (!append_json_raw(buffer, capacity, length, "null", 4)) {
+        return false;
+      }
+      continue;
+    }
+    const uint8_t* payload = blob + entry->offset;
+    size_t payload_size = entry->size;
+    if (!append_json_from_payload(field, payload, payload_size, buffer, capacity, length)) {
+      return false;
+    }
+  }
+  return append_json_raw(buffer, capacity, length, "}", 1);
+}
+
+static bool append_json_from_payload(const apxdb_schema_field_t* field, const uint8_t* payload, size_t payload_size, char** buffer, size_t* capacity, size_t* length) {
+  if (!field || !payload || !buffer || !capacity || !length) {
+    return false;
+  }
+  switch (field->type) {
+    case APXDB_TYPE_BYTE:
+    case APXDB_TYPE_SHORT:
+    case APXDB_TYPE_INT:
+    case APXDB_TYPE_DOUBLE:
+    case APXDB_TYPE_FLOAT:
+    case APXDB_TYPE_DATETIME:
+    case APXDB_TYPE_ENUM:
+    case APXDB_TYPE_BOOL:
+    case APXDB_TYPE_STRING: {
+      char* value_str = blob_value_to_string(field, payload, payload_size);
+      if (!value_str) {
+        return false;
+      }
+      bool ok;
+      if (field->type == APXDB_TYPE_STRING) {
+        ok = append_json_string(buffer, capacity, length, value_str);
+      } else {
+        ok = append_json_raw(buffer, capacity, length, value_str, strlen(value_str));
+      }
+      free(value_str);
+      return ok;
+    }
+    case APXDB_TYPE_EMBEDDED: {
+      if (payload_size < sizeof(uint32_t)) {
+        return false;
+      }
+      uint32_t nested_size;
+      memcpy(&nested_size, payload, sizeof(uint32_t));
+      if (payload_size < sizeof(uint32_t) + nested_size) {
+        return false;
+      }
+      return append_json_object_from_blob(field->embedded_schema, payload + sizeof(uint32_t), nested_size, buffer, capacity, length);
+    }
+    case APXDB_TYPE_LIST: {
+      if (payload_size < sizeof(uint32_t)) {
+        return false;
+      }
+      uint32_t count;
+      memcpy(&count, payload, sizeof(uint32_t));
+      const uint8_t* cursor = payload + sizeof(uint32_t);
+      size_t remaining = payload_size - sizeof(uint32_t);
+      apxdb_schema_field_t element_field = *field;
+      element_field.type = field->list_element_type;
+      element_field.embedded_schema = field->list_element_schema;
+
+      if (!append_json_raw(buffer, capacity, length, "[", 1)) {
+        return false;
+      }
+      for (uint32_t i = 0; i < count; ++i) {
+        if (i > 0) {
+          if (!append_json_raw(buffer, capacity, length, ",", 1)) {
+            return false;
+          }
+        }
+        size_t element_size = 0;
+        if (element_field.type == APXDB_TYPE_STRING || element_field.type == APXDB_TYPE_EMBEDDED) {
+          if (remaining < sizeof(uint32_t)) {
+            return false;
+          }
+          uint32_t element_size_u32;
+          memcpy(&element_size_u32, cursor, sizeof(uint32_t));
+          cursor += sizeof(uint32_t);
+          remaining -= sizeof(uint32_t);
+          element_size = element_size_u32;
+        } else {
+          element_size = scalar_type_size(element_field.type);
+        }
+        if (remaining < element_size) {
+          return false;
+        }
+        if (element_field.type == APXDB_TYPE_STRING) {
+          char* element_text = (char*)malloc(element_size + 1);
+          if (!element_text) {
+            return false;
+          }
+          memcpy(element_text, cursor, element_size);
+          element_text[element_size] = '\0';
+          bool ok = append_json_string(buffer, capacity, length, element_text);
+          free(element_text);
+          if (!ok) {
+            return false;
+          }
+        } else if (element_field.type == APXDB_TYPE_EMBEDDED) {
+          if (!append_json_object_from_blob(element_field.embedded_schema, cursor, element_size, buffer, capacity, length)) {
+            return false;
+          }
+        } else {
+          if (!append_json_from_payload(&element_field, cursor, element_size, buffer, capacity, length)) {
+            return false;
+          }
+        }
+        cursor += element_size;
+        remaining -= element_size;
+      }
+      return append_json_raw(buffer, capacity, length, "]", 1);
+    }
+    default:
+      return false;
+  }
+}
+
+static bool is_blob_field_null_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, size_t field_index, const uint8_t* blob, size_t blob_size) {
+  if (!layout || !schema || field_index >= schema->field_count || !blob) {
+    return false;
+  }
+  const apxdb_schema_field_t* field = &schema->fields[field_index];
+  if (!field->nullable) {
+    return false;
+  }
+  size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
+  if (blob_size < header_size + layout->row_fixed_size) {
+    return false;
+  }
+  const uint8_t* row_body = blob + header_size;
+  uint32_t nullable_bit_index = 0;
+  for (size_t i = 0; i < field_index; ++i) {
+    if (schema->fields[i].nullable) {
+      nullable_bit_index += 1;
+    }
+  }
+  uint32_t byte_index = nullable_bit_index / 8;
+  uint32_t bit_index = nullable_bit_index % 8;
+  if (byte_index >= layout->nullable_bitmap_size) {
+    return false;
+  }
+  return (row_body[byte_index] & (uint8_t)(1u << bit_index)) != 0;
+}
+
+static bool get_blob_payload_for_field_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, size_t field_index, const uint8_t* blob, size_t blob_size, const uint8_t** out_payload, size_t* out_payload_size) {
+  if (!layout || !schema || !out_payload || !out_payload_size || field_index >= schema->field_count || !blob) {
+    return false;
+  }
+  const apxdb_collection_field_layout_t* field_layout = &layout->fields[field_index];
+  size_t header_size = sizeof(uint32_t) * 3 + schema->field_count * sizeof(apxdb_document_field_entry_t);
+  if (blob_size < header_size + layout->row_fixed_size) {
+    return false;
+  }
+  const uint8_t* row_body = blob + header_size;
+  if (field_layout->storage_kind == APXDB_STORAGE_VARIABLE) {
+    if (field_layout->offset + sizeof(uint32_t) * 2 > layout->row_fixed_size) {
+      return false;
+    }
+    const uint32_t* slot = (const uint32_t*)(row_body + field_layout->offset);
+    uint32_t payload_offset = slot[0];
+    uint32_t payload_size = slot[1];
+    if (payload_size == 0 || payload_offset + payload_size > blob_size - header_size) {
+      return false;
+    }
+    *out_payload = row_body + payload_offset;
+    *out_payload_size = payload_size;
+    return true;
+  }
+  if (field_layout->offset + field_layout->size > layout->row_fixed_size) {
+    return false;
+  }
+  *out_payload = row_body + field_layout->offset;
+  *out_payload_size = field_layout->size;
+  return true;
+}
+
+static char* build_document_json_from_blob(const apxdb_collection_t* collection, const uint8_t* blob, size_t blob_size) {
+  if (!collection || !collection->schema || !blob) {
+    return NULL;
+  }
+  const apxdb_schema_t* schema = collection->schema;
+  char* buffer = NULL;
+  size_t capacity = 0;
+  size_t length = 0;
+  if (!append_json_raw(&buffer, &capacity, &length, "{", 1)) {
+    free(buffer);
+    return NULL;
+  }
+
+  bool first = true;
+  for (size_t i = 0; i < schema->field_count; ++i) {
+    const apxdb_schema_field_t* field = &schema->fields[i];
+    if (!first) {
+      if (!append_json_raw(&buffer, &capacity, &length, ",", 1)) {
+        free(buffer);
+        return NULL;
+      }
+    }
+    first = false;
+    if (!append_json_string(&buffer, &capacity, &length, field->name)) {
+      free(buffer);
+      return NULL;
+    }
+    if (!append_json_raw(&buffer, &capacity, &length, ":", 1)) {
+      free(buffer);
+      return NULL;
+    }
+
+    const uint8_t* payload = NULL;
+    size_t payload_size = 0;
+    bool is_null = false;
+    if (collection->layout && collection->layout->field_count == schema->field_count) {
+      if (field->nullable && is_blob_field_null_with_layout(collection->layout, schema, i, blob, blob_size)) {
+        is_null = true;
+      } else if (!get_blob_payload_for_field_with_layout(collection->layout, schema, i, blob, blob_size, &payload, &payload_size)) {
+        if (field->nullable) {
+          is_null = true;
+        } else {
+          free(buffer);
+          return NULL;
+        }
+      }
+    } else {
+      const apxdb_document_field_entry_t* entry = get_blob_field_entry(blob, blob_size, i);
+      if (!entry) {
+        free(buffer);
+        return NULL;
+      }
+      if (entry->is_null) {
+        is_null = true;
+      } else {
+        payload = blob + entry->offset;
+        payload_size = entry->size;
+      }
+    }
+
+    if (is_null) {
+      if (!append_json_raw(&buffer, &capacity, &length, "null", 4)) {
+        free(buffer);
+        return NULL;
+      }
+      continue;
+    }
+
+    if (!append_json_from_payload(field, payload, payload_size, &buffer, &capacity, &length)) {
+      free(buffer);
+      return NULL;
+    }
+  }
+
+  if (!append_json_raw(&buffer, &capacity, &length, "}", 1)) {
+    free(buffer);
+    return NULL;
+  }
+  return buffer;
+}
+
 static bool blob_payload_to_double(const apxdb_schema_field_t* field, const uint8_t* payload, size_t payload_size, double* out_value) {
   if (!field || !payload || !out_value) {
     return false;
@@ -1116,7 +1711,19 @@ static apxdb_index_entry_t* find_index_entry(apxdb_index_data_t* index, const ch
     return NULL;
   }
   for (size_t i = 0; i < index->entry_count; ++i) {
-    if (strcmp(index->entries[i].key, key) == 0) {
+    if (index->entries[i].key && strcmp(index->entries[i].key, key) == 0) {
+      return &index->entries[i];
+    }
+  }
+  return NULL;
+}
+
+static apxdb_index_entry_t* find_index_entry_by_numeric(apxdb_index_data_t* index, double numeric_key) {
+  if (!index) {
+    return NULL;
+  }
+  for (size_t i = 0; i < index->entry_count; ++i) {
+    if (index->entries[i].has_numeric_key && index->entries[i].numeric_key == numeric_key) {
       return &index->entries[i];
     }
   }
@@ -1252,7 +1859,17 @@ static char* build_documents_array_from_ids(apxdb_collection_t* collection, char
     if (!doc) {
       continue;
     }
-    size_t doc_length = strlen(doc->json);
+    char* json = NULL;
+    if (collection->layout && doc->blob) {
+      json = build_document_json_from_blob(collection, doc->blob, doc->blob_size);
+    }
+    if (!json && doc->json) {
+      json = allocate_string_copy(doc->json);
+    }
+    if (!json) {
+      continue;
+    }
+    size_t doc_length = strlen(json);
     size_t needed = length + doc_length + 3;
     if (needed > buffer_capacity) {
       size_t next_capacity = buffer_capacity;
@@ -1261,6 +1878,7 @@ static char* build_documents_array_from_ids(apxdb_collection_t* collection, char
       }
       char* next = (char*)realloc(buffer, next_capacity);
       if (!next) {
+        free(json);
         free(buffer);
         return NULL;
       }
@@ -1270,9 +1888,10 @@ static char* build_documents_array_from_ids(apxdb_collection_t* collection, char
     if (!first) {
       buffer[length++] = ',';
     }
-    memcpy(buffer + length, doc->json, doc_length);
+    memcpy(buffer + length, json, doc_length);
     length += doc_length;
     first = false;
+    free(json);
   }
 
   if (length + 2 > buffer_capacity) {
@@ -1300,30 +1919,50 @@ static char* build_documents_array(apxdb_collection_t* collection, const char* q
 
   bool first = true;
   for (size_t i = 0; i < collection->document_count; ++i) {
-    const char* doc = collection->documents[i].json;
-    if (!query || strstr(doc, query) != NULL) {
-      size_t doc_length = strlen(doc);
-      size_t needed = length + doc_length + 3;
-      if (needed > buffer_capacity) {
-        size_t next_capacity = buffer_capacity;
-        while (next_capacity < needed) {
-          next_capacity *= 2;
-        }
-        char* next = (char*)realloc(buffer, next_capacity);
-        if (!next) {
-          free(buffer);
-          return NULL;
-        }
-        buffer = next;
-        buffer_capacity = next_capacity;
+    apxdb_collection_document_t* doc = &collection->documents[i];
+    bool matches = false;
+    char* json = NULL;
+    if (collection->layout && doc->blob) {
+      json = build_document_json_from_blob(collection, doc->blob, doc->blob_size);
+      if (json && (!query || strstr(json, query) != NULL)) {
+        matches = true;
       }
-      if (!first) {
-        buffer[length++] = ',';
-      }
-      memcpy(buffer + length, doc, doc_length);
-      length += doc_length;
-      first = false;
     }
+    if (!matches && doc->json) {
+      if (!query || strstr(doc->json, query) != NULL) {
+        matches = true;
+        if (!json) {
+          json = allocate_string_copy(doc->json);
+        }
+      }
+    }
+    if (!matches || !json) {
+      free(json);
+      continue;
+    }
+    size_t doc_length = strlen(json);
+    size_t needed = length + doc_length + 3;
+    if (needed > buffer_capacity) {
+      size_t next_capacity = buffer_capacity;
+      while (next_capacity < needed) {
+        next_capacity *= 2;
+      }
+      char* next = (char*)realloc(buffer, next_capacity);
+      if (!next) {
+        free(json);
+        free(buffer);
+        return NULL;
+      }
+      buffer = next;
+      buffer_capacity = next_capacity;
+    }
+    if (!first) {
+      buffer[length++] = ',';
+    }
+    memcpy(buffer + length, json, doc_length);
+    length += doc_length;
+    first = false;
+    free(json);
   }
 
   if (length + 2 > buffer_capacity) {
@@ -1355,6 +1994,7 @@ int32_t apxdb_register_collection(const apxdb_schema_t* schema) {
     return -1;
   }
   collection->schema = schema;
+  collection->layout = apxdb_find_collection_layout_by_name(schema->collection_name);
   g_collections[g_collection_count++] = collection;
   return 0;
 }
@@ -1566,7 +2206,7 @@ static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* 
       const apxdb_schema_field_t* payload_field = NULL;
       const uint8_t* payload = NULL;
       size_t payload_size = 0;
-      if (!get_blob_field_payload(collection->schema, collection->documents[i].blob, collection->documents[i].blob_size, field_path, &payload_field, &payload, &payload_size)) {
+      if (!get_collection_blob_field_payload(collection, collection->documents[i].blob, collection->documents[i].blob_size, field_path, &payload_field, &payload, &payload_size)) {
         valid_mask[i] = 0;
         values[i] = 0;
         continue;
@@ -1944,7 +2584,7 @@ static bool save_collection_index_file(apxdb_collection_t* collection, const cha
     fclose(file);
     return false;
   }
-  if (!write_uint32_to_file(file, 1)) {
+  if (!write_uint32_to_file(file, 3)) {
     fclose(file);
     return false;
   }
@@ -1987,8 +2627,11 @@ static bool save_collection_index_file(apxdb_collection_t* collection, const cha
     }
     for (size_t j = 0; j < index->entry_count; ++j) {
       apxdb_index_entry_t* entry = &index->entries[j];
+      uint8_t key_kind = entry->has_numeric_key ? 1 : 0;
       uint32_t key_length = (uint32_t)strlen(entry->key);
-      if (!write_uint32_to_file(file, key_length) || !write_bytes_to_file(file, entry->key, key_length) ||
+      if (!write_uint8_to_file(file, key_kind) || !write_uint32_to_file(file, key_length) ||
+          !write_bytes_to_file(file, entry->key, key_length) ||
+          (key_kind == 1 && !write_bytes_to_file(file, &entry->numeric_key, sizeof(entry->numeric_key))) ||
           !write_uint32_to_file(file, (uint32_t)entry->doc_count)) {
         fclose(file);
         remove(temp_path);
@@ -2034,7 +2677,7 @@ static bool load_collection_index_file(apxdb_collection_t* collection, const cha
   }
 
   uint32_t version;
-  if (!read_uint32_from_file(file, &version) || (version != 1 && version != 2)) {
+  if (!read_uint32_from_file(file, &version) || (version != 1 && version != 2 && version != 3)) {
     fclose(file);
     return false;
   }
@@ -2148,6 +2791,16 @@ static bool load_collection_index_file(apxdb_collection_t* collection, const cha
     }
 
     for (uint32_t j = 0; j < entry_count; ++j) {
+      uint8_t key_kind = 0;
+      if (version >= 3) {
+        if (!read_uint8_from_file(file, &key_kind)) {
+          free_index_data(index);
+          clear_loaded_index_data(collection, loaded_index_count);
+          fclose(file);
+          return false;
+        }
+      }
+
       uint32_t key_length;
       if (!read_uint32_from_file(file, &key_length) || key_length == 0) {
         free_index_data(index);
@@ -2163,6 +2816,19 @@ static bool load_collection_index_file(apxdb_collection_t* collection, const cha
         return false;
       }
       index->entries[j].key[key_length] = '\0';
+
+      if (key_kind == 1) {
+        if (!read_bytes_from_file(file, &index->entries[j].numeric_key, sizeof(index->entries[j].numeric_key))) {
+          free_index_data(index);
+          clear_loaded_index_data(collection, loaded_index_count);
+          fclose(file);
+          return false;
+        }
+        index->entries[j].has_numeric_key = true;
+      } else {
+        index->entries[j].has_numeric_key = false;
+        index->entries[j].numeric_key = 0.0;
+      }
 
       uint32_t doc_count;
       if (!read_uint32_from_file(file, &doc_count)) {
@@ -2480,6 +3146,7 @@ static char** scan_docs_for_member(apxdb_collection_t* collection, const apxdb_j
     return NULL;
   }
 
+  set_last_query_plan(APXDB_QUERY_PLAN_SCAN);
   reset_last_query_metrics();
   uint64_t query_start_ns = now_ns();
 
@@ -2515,7 +3182,7 @@ static char** scan_docs_for_member(apxdb_collection_t* collection, const apxdb_j
     const apxdb_schema_field_t* field = NULL;
     const uint8_t* payload = NULL;
     size_t payload_size = 0;
-    if (!get_blob_field_payload(collection->schema, collection->documents[i].blob, collection->documents[i].blob_size, member->name, &field, &payload, &payload_size)) {
+    if (!get_collection_blob_field_payload(collection, collection->documents[i].blob, collection->documents[i].blob_size, member->name, &field, &payload, &payload_size)) {
       continue;
     }
     if (!blob_field_matches_value(field, payload, payload_size, member->value)) {
@@ -2785,7 +3452,18 @@ static bool add_index_key(apxdb_collection_t* collection, size_t doc_index, cons
   if (!key) {
     return false;
   }
-  apxdb_index_entry_t* entry = find_index_entry(index, key);
+  double numeric_key = 0.0;
+  bool has_numeric_key = false;
+  if (blob_payload_to_double(field, payload, payload_size, &numeric_key)) {
+    has_numeric_key = true;
+  }
+  apxdb_index_entry_t* entry = NULL;
+  if (has_numeric_key) {
+    entry = find_index_entry_by_numeric(index, numeric_key);
+  }
+  if (!entry) {
+    entry = find_index_entry(index, key);
+  }
   if (!entry) {
     if (index->entry_count >= index->entry_capacity) {
       size_t next_capacity = index->entry_capacity == 0 ? 4 : index->entry_capacity * 2;
@@ -2799,14 +3477,23 @@ static bool add_index_key(apxdb_collection_t* collection, size_t doc_index, cons
     }
     apxdb_index_entry_t* new_entry = &index->entries[index->entry_count++];
     new_entry->key = key;
+    new_entry->has_numeric_key = has_numeric_key;
+    new_entry->numeric_key = numeric_key;
     new_entry->doc_ids = NULL;
     new_entry->doc_count = 0;
     new_entry->doc_capacity = 0;
     return add_doc_id_to_entry(new_entry, collection->documents[doc_index].id);
   }
-  bool ok = add_doc_id_to_entry(entry, collection->documents[doc_index].id);
-  free(key);
-  return ok;
+  if (!entry->key) {
+    entry->key = key;
+  } else {
+    free(key);
+  }
+  if (has_numeric_key && !entry->has_numeric_key) {
+    entry->has_numeric_key = true;
+    entry->numeric_key = numeric_key;
+  }
+  return add_doc_id_to_entry(entry, collection->documents[doc_index].id);
 }
 
 static const apxdb_json_value_t* json_path_get(const apxdb_json_value_t* value, const char* path) {
@@ -2962,6 +3649,9 @@ static void set_last_query_diagnostics(apxdb_query_path_t path, uint32_t count) 
   (void)path;
   (void)count;
 }
+static void set_last_query_plan(apxdb_query_plan_t plan) {
+  (void)plan;
+}
 #endif
 
 static bool is_gpu_runtime_available(void) {
@@ -2977,6 +3667,17 @@ int32_t apxdb_last_query_path(void) {
   return path;
 #else
   return APXDB_QUERY_CPU_ONLY;
+#endif
+}
+
+int32_t apxdb_last_query_plan(void) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  int32_t plan = (int32_t)g_last_query_plan;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+  return plan;
+#else
+  return APXDB_QUERY_PLAN_SCAN;
 #endif
 }
 
@@ -3005,7 +3706,7 @@ static bool index_document(apxdb_collection_t* collection, size_t doc_index, con
     }
     const uint8_t* payload = NULL;
     size_t payload_size = 0;
-    if (!get_blob_field_payload(collection->schema, blob, blob_size, index_def->field_name, &field, &payload, &payload_size)) {
+    if (!get_collection_blob_field_payload(collection, blob, blob_size, index_def->field_name, &field, &payload, &payload_size)) {
       continue;
     }
     if (!add_index_key(collection, doc_index, index_def->field_name, field, payload, payload_size)) {
@@ -3176,6 +3877,12 @@ const char* apxdb_get_document(const char* collection_name, const char* id) {
   if (!doc) {
     return NULL;
   }
+  if (collection->layout && doc->blob) {
+    char* json = build_document_json_from_blob(collection, doc->blob, doc->blob_size);
+    if (json) {
+      return json;
+    }
+  }
   return allocate_string_copy(doc->json);
 }
 
@@ -3224,15 +3931,19 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
   }
 
   reset_last_query_metrics();
-  update_last_query_metrics_path(APXDB_QUERY_CPU_ONLY);
+  update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
 
   char** results = NULL;
   size_t result_count = 0;
   size_t result_capacity = 0;
 
+  set_last_query_plan(APXDB_QUERY_PLAN_INDEX_RANGE);
+  set_last_query_diagnostics(APXDB_QUERY_INDEX_RANGE, 0);
   for (size_t i = 0; i < index->entry_count; ++i) {
     double key_value;
-    if (!parse_numeric_value((apxdb_json_value_t*)&(apxdb_json_value_t){.type = APXDB_JSON_STRING, .u.string_value = index->entries[i].key}, &key_value)) {
+    if (index->entries[i].has_numeric_key) {
+      key_value = index->entries[i].numeric_key;
+    } else if (!parse_numeric_value((apxdb_json_value_t*)&(apxdb_json_value_t){.type = APXDB_JSON_STRING, .u.string_value = index->entries[i].key}, &key_value)) {
       continue;
     }
     if (!compare_numeric_operator(key_value, op, threshold)) {
@@ -3254,6 +3965,11 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
   }
 
   *out_count = result_count;
+  if (result_count > 0) {
+    update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
+  } else {
+    update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
+  }
   set_last_query_metrics_result_count(result_count);
   set_last_query_metrics_total_ns(0);
   return results;
@@ -3261,38 +3977,98 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
 
 static char** find_docs_for_member(apxdb_collection_t* collection, const apxdb_json_member_t* member, size_t* out_count);
 
+static apxdb_query_plan_t determine_query_plan(apxdb_collection_t* collection, const apxdb_json_member_t* member, apxdb_index_data_t** out_index) {
+  if (!collection || !member || !out_index) {
+    return APXDB_QUERY_PLAN_SCAN;
+  }
+
+  *out_index = find_index_data(collection, member->name);
+  if (!*out_index) {
+    return APXDB_QUERY_PLAN_SCAN;
+  }
+
+  if (member->value->type == APXDB_JSON_OBJECT && (*out_index)->definition.index_type == APXDB_INDEX_TYPE_VALUE && member->value->u.object.count == 1) {
+    const apxdb_json_member_t* op_member = &member->value->u.object.members[0];
+    double threshold;
+    if (parse_numeric_value(op_member->value, &threshold)) {
+      return APXDB_QUERY_PLAN_INDEX_RANGE;
+    }
+    return APXDB_QUERY_PLAN_SCAN;
+  }
+
+  double numeric_value;
+  if (parse_numeric_value(member->value, &numeric_value)) {
+    return APXDB_QUERY_PLAN_INDEX_EXACT;
+  }
+
+  if (member->value->type == APXDB_JSON_STRING) {
+    return APXDB_QUERY_PLAN_INDEX_EXACT;
+  }
+
+  return APXDB_QUERY_PLAN_SCAN;
+}
+
+static void set_last_query_plan(apxdb_query_plan_t plan) {
+#if defined(APXDB_ENABLE_DIAGNOSTICS)
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_plan = plan;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+#else
+  (void)plan;
+#endif
+}
+
 static char** find_docs_for_member(apxdb_collection_t* collection, const apxdb_json_member_t* member, size_t* out_count) {
   if (!collection || !member || !out_count) {
     return NULL;
   }
 
-  apxdb_index_data_t* index = find_index_data(collection, member->name);
-  if (index) {
-    if (member->value->type == APXDB_JSON_OBJECT) {
-      if (index->definition.index_type == APXDB_INDEX_TYPE_VALUE && member->value->u.object.count == 1) {
-        const apxdb_json_member_t* op_member = &member->value->u.object.members[0];
-        double threshold;
-        if (parse_numeric_value(op_member->value, &threshold)) {
-          return collect_docs_by_range(collection, index, op_member->name, threshold, out_count);
-        }
-      }
-    } else {
-      char* key = json_value_to_string(member->value);
-      if (key) {
-        apxdb_index_entry_t* entry = find_index_entry(index, key);
-        free(key);
-        if (entry) {
-          reset_last_query_metrics();
-          update_last_query_metrics_path(APXDB_QUERY_CPU_ONLY);
-          *out_count = entry->doc_count;
-          set_last_query_metrics_result_count(*out_count);
-          set_last_query_metrics_total_ns(0);
-          return copy_doc_id_list(entry->doc_ids, entry->doc_count);
-        }
-      }
+  apxdb_index_data_t* index = NULL;
+  apxdb_query_plan_t plan = determine_query_plan(collection, member, &index);
+  if (plan == APXDB_QUERY_PLAN_INDEX_RANGE && index) {
+    const apxdb_json_member_t* op_member = &member->value->u.object.members[0];
+    double threshold;
+    if (parse_numeric_value(op_member->value, &threshold)) {
+      return collect_docs_by_range(collection, index, op_member->name, threshold, out_count);
     }
   }
 
+  if (plan == APXDB_QUERY_PLAN_INDEX_EXACT && index) {
+    double numeric_value;
+    if (parse_numeric_value(member->value, &numeric_value)) {
+      set_last_query_plan(APXDB_QUERY_PLAN_INDEX_EXACT);
+      set_last_query_diagnostics(APXDB_QUERY_INDEX_EXACT, 0);
+      apxdb_index_entry_t* entry = find_index_entry_by_numeric(index, numeric_value);
+      if (entry) {
+        reset_last_query_metrics();
+        update_last_query_metrics_path(APXDB_QUERY_INDEX_EXACT);
+        *out_count = entry->doc_count;
+        set_last_query_metrics_result_count(*out_count);
+        set_last_query_metrics_total_ns(0);
+        return copy_doc_id_list(entry->doc_ids, entry->doc_count);
+      }
+      return copy_doc_id_list(NULL, 0);
+    }
+
+    char* key = json_value_to_string(member->value);
+    if (key) {
+      set_last_query_plan(APXDB_QUERY_PLAN_INDEX_EXACT);
+      set_last_query_diagnostics(APXDB_QUERY_INDEX_EXACT, 0);
+      apxdb_index_entry_t* entry = find_index_entry(index, key);
+      free(key);
+      if (entry) {
+        reset_last_query_metrics();
+        update_last_query_metrics_path(APXDB_QUERY_INDEX_EXACT);
+        *out_count = entry->doc_count;
+        set_last_query_metrics_result_count(*out_count);
+        set_last_query_metrics_total_ns(0);
+        return copy_doc_id_list(entry->doc_ids, entry->doc_count);
+      }
+      return copy_doc_id_list(NULL, 0);
+    }
+  }
+
+  set_last_query_plan(APXDB_QUERY_PLAN_SCAN);
   return scan_docs_for_member(collection, member, out_count);
 }
 
@@ -3518,10 +4294,18 @@ const char* apxdb_put_document(const char* collection_name, const char* json_utf
 
   uint8_t* blob = NULL;
   size_t blob_size = 0;
-  if (!serialize_document_blob(collection->schema, &doc_value, &blob, &blob_size)) {
-    apxdb_json_free(&doc_value);
-    free(id);
-    return NULL;
+  if (collection->layout) {
+    if (!serialize_document_blob_with_layout(collection->layout, collection->schema, &doc_value, &blob, &blob_size)) {
+      apxdb_json_free(&doc_value);
+      free(id);
+      return NULL;
+    }
+  } else {
+    if (!serialize_document_blob(collection->schema, &doc_value, &blob, &blob_size)) {
+      apxdb_json_free(&doc_value);
+      free(id);
+      return NULL;
+    }
   }
 
   if (!append_document(collection, id, json_utf8, blob, blob_size)) {

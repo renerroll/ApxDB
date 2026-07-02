@@ -26,6 +26,21 @@ void main() {
 
 - Android: the native C library is built by Gradle/CMake
 - iOS/macOS: the plugin includes Objective-C++ wrappers that compile the shared native engine
+- Native test build (current canonical command):
+  ```bash
+  clang -std=c11 -DAPXDB_ENABLE_DIAGNOSTICS -I src/native \
+        apxdb.c apxdb_schema.c apxdb_collection.c apxdb_json.c apxdb_index_test.c \
+        -o /tmp/apxdb_index_test
+  ```
+  Alternatively, the separate-object build path is also supported:
+  ```bash
+  clang -std=c11 -DAPXDB_ENABLE_DIAGNOSTICS -I src/native -c src/native/apxdb.c -o apxdb.o
+  clang -std=c11 -DAPXDB_ENABLE_DIAGNOSTICS -I src/native -c src/native/apxdb_schema.c -o apxdb_schema.o
+  clang -std=c11 -DAPXDB_ENABLE_DIAGNOSTICS -I src/native -c src/native/apxdb_collection.c -o apxdb_collection.o
+  clang -std=c11 -DAPXDB_ENABLE_DIAGNOSTICS -I src/native -c src/native/apxdb_json.c -o apxdb_json.o
+  clang -std=c11 -DAPXDB_ENABLE_DIAGNOSTICS -I src/native -c src/native/apxdb_index_test.c -o apxdb_index_test.o
+  clang -std=c11 -DAPXDB_ENABLE_DIAGNOSTICS apxdb.o apxdb_schema.o apxdb_collection.o apxdb_json.o apxdb_index_test.o -o /tmp/apxdb_index_test
+  ```
 
 ## Schema and supported types
 

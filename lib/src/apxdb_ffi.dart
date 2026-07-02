@@ -1,4 +1,5 @@
 import 'dart:ffi';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
@@ -15,6 +16,19 @@ typedef _DartGpuStatus = int Function();
 
 typedef _CCreateDocument = Pointer<Utf8> Function(Pointer<Utf8> json);
 typedef _DartCreateDocument = Pointer<Utf8> Function(Pointer<Utf8> json);
+
+typedef _CCreateDocumentBytes = Pointer<Utf8> Function(
+    Pointer<Uint8> bytes, IntPtr length);
+typedef _DartCreateDocumentBytes = Pointer<Utf8> Function(
+    Pointer<Uint8> bytes, int length);
+
+typedef _CGetDocumentBytes = Pointer<Uint8> Function(
+    Pointer<Utf8> id, Pointer<IntPtr> outLength);
+typedef _DartGetDocumentBytes = Pointer<Uint8> Function(
+    Pointer<Utf8> id, Pointer<IntPtr> outLength);
+
+typedef _CReleaseBytes = Void Function(Pointer<Uint8> bytes);
+typedef _DartReleaseBytes = void Function(Pointer<Uint8> bytes);
 
 typedef _CFindDocument = Pointer<Utf8> Function(Pointer<Utf8> query);
 typedef _DartFindDocument = Pointer<Utf8> Function(Pointer<Utf8> query);
@@ -35,6 +49,9 @@ class ApxDbBindings {
   final _DartQueryPath lastQueryPath;
   final _DartQueryDocCount lastQueryDocCount;
   final _DartCreateDocument createDocument;
+  final _DartCreateDocumentBytes createDocumentBytes;
+  final _DartGetDocumentBytes getDocumentBytes;
+  final _DartReleaseBytes releaseBytes;
   final _DartFindDocument findDocument;
   final _DartReleaseString releaseString;
 
@@ -51,6 +68,14 @@ class ApxDbBindings {
         createDocument =
             lib.lookupFunction<_CCreateDocument, _DartCreateDocument>(
                 'apxdb_create_document'),
+        createDocumentBytes =
+            lib.lookupFunction<_CCreateDocumentBytes, _DartCreateDocumentBytes>(
+                'apxdb_create_document_bytes'),
+        getDocumentBytes =
+            lib.lookupFunction<_CGetDocumentBytes, _DartGetDocumentBytes>(
+                'apxdb_get_document_bytes'),
+        releaseBytes = lib.lookupFunction<_CReleaseBytes, _DartReleaseBytes>(
+            'apxdb_release_bytes'),
         findDocument = lib.lookupFunction<_CFindDocument, _DartFindDocument>(
             'apxdb_find_document'),
         releaseString = lib.lookupFunction<_CReleaseString, _DartReleaseString>(
@@ -63,6 +88,9 @@ class ApxDbBindings {
     required this.lastQueryPath,
     required this.lastQueryDocCount,
     required this.createDocument,
+    required this.createDocumentBytes,
+    required this.getDocumentBytes,
+    required this.releaseBytes,
     required this.findDocument,
     required this.releaseString,
   });
@@ -126,6 +154,33 @@ class ApxDB {
     final result = resultPointer.toDartString();
     _bindings.releaseString(resultPointer);
     return result;
+  }
+
+  static String createDocumentBytes(Uint8List bytes) {
+    final buffer = calloc<Uint8>(bytes.length);
+    final nativeBytes = buffer.asTypedList(bytes.length);
+    nativeBytes.setAll(0, bytes);
+    final resultPointer = _bindings.createDocumentBytes(buffer, bytes.length);
+    calloc.free(buffer);
+    final result = resultPointer.toDartString();
+    _bindings.releaseString(resultPointer);
+    return result;
+  }
+
+  static Uint8List getDocumentBytes(String id) {
+    final idPointer = id.toNativeUtf8();
+    final outLength = calloc<IntPtr>();
+    final resultPointer = _bindings.getDocumentBytes(idPointer, outLength);
+    calloc.free(idPointer);
+    final length = outLength.value;
+    calloc.free(outLength);
+    if (resultPointer.address == 0 || length <= 0) {
+      return Uint8List(0);
+    }
+    final bytes = resultPointer.asTypedList(length);
+    final copy = Uint8List.fromList(bytes);
+    _bindings.releaseBytes(resultPointer);
+    return copy;
   }
 
   static String findDocument(String query) {
