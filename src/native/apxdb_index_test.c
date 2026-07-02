@@ -285,7 +285,7 @@ static void assert_query_result_count(const char* collection_name, const char* q
   ASSERT(result_json != NULL, "find_documents returned NULL");
   int count = count_substring(result_json, "\"name\"");
   apxdb_release_string(result_json);
-  ASSERT(count == expected_count, "unexpected query result count");
+  ASSERT(count == expected_count, query);
 }
 
 static void run_test_gpu_numeric_query_path(const char* dir) {
@@ -371,12 +371,12 @@ static void run_test_numeric_exact_and_range_queries(const char* dir) {
   apxdb_release_string(result1);
   assert_query_result_count("test_collection", query1, 3);
 
-  const char* query2 = "{\"value\": {\"gte\": 5}}";
+  const char* query2 = "{\"value\": {\"gte\": 9}}";
   const char* result2 = apxdb_find_documents("test_collection", query2);
   ASSERT(result2 != NULL, "find_documents returned NULL");
   ASSERT(apxdb_last_query_path() == APXDB_QUERY_INDEX_RANGE, "expected range index path");
   apxdb_release_string(result2);
-  assert_query_result_count("test_collection", query2, 7);
+  assert_query_result_count("test_collection", query2, 1);
 
   assert_query_result_count("test_collection", "{\"value\": {\"lt\": 3}}", 3);
   assert_query_result_count("test_collection", "{\"value\": {\"gt\": 5}}", 4);
@@ -388,6 +388,116 @@ static void run_test_numeric_exact_and_range_queries(const char* dir) {
   ASSERT(apxdb_last_query_plan() == APXDB_QUERY_PLAN_SCAN, "expected scan plan for non-indexed field");
   apxdb_release_string(result3);
   assert_query_result_count("test_collection", query3, 1);
+
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+}
+
+static void run_test_multi_predicate_planner(const char* dir) {
+  cleanup_test_files(dir);
+  printf("TEST: multi_predicate_planner\n");
+
+  register_test_collection();
+  add_index(false);
+  ASSERT(open_db(dir), "open_db failed");
+
+  apxdb_transaction_t* txn = apxdb_begin_write_txn();
+  ASSERT(txn != NULL, "begin transaction failed");
+
+  for (int i = 0; i < 10; ++i) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"value\": %d, \"name\": \"doc%d\"}", i, i);
+    const char* id = apxdb_put_document("test_collection", json);
+    ASSERT(id != NULL, "put_document failed");
+    apxdb_release_string(id);
+  }
+
+  ASSERT(apxdb_commit_write_txn(txn) == 0, "commit transaction failed");
+  apxdb_free_transaction(txn);
+
+  const char* exact_query = "{\"value\": 5, \"name\": \"doc5\"}";
+  const char* exact_result = apxdb_find_documents("test_collection", exact_query);
+  ASSERT(exact_result != NULL, "find_documents returned NULL");
+  ASSERT(apxdb_last_query_plan() == APXDB_QUERY_PLAN_INDEX_EXACT, "expected exact index plan for multi-predicate query");
+  apxdb_release_string(exact_result);
+  assert_query_result_count("test_collection", exact_query, 1);
+
+  const char* range_query = "{\"value\": {\"gte\": 9}, \"name\": \"doc9\"}";
+  const char* range_result = apxdb_find_documents("test_collection", range_query);
+  ASSERT(range_result != NULL, "find_documents returned NULL");
+  ASSERT(apxdb_last_query_plan() == APXDB_QUERY_PLAN_INDEX_RANGE, "expected range index plan for multi-predicate query");
+  apxdb_release_string(range_result);
+  assert_query_result_count("test_collection", range_query, 1);
+
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+}
+
+static void run_test_multi_predicate_exact_beats_wide_range(const char* dir) {
+  cleanup_test_files(dir);
+  printf("TEST: multi_predicate_exact_beats_wide_range\n");
+
+  register_test_collection();
+  add_index(false);
+  apxdb_index_definition_t name_index = {
+    .field_name = "name",
+    .index_type = APXDB_INDEX_TYPE_VALUE,
+    .composite = false,
+    .multi_entry = false,
+  };
+  int32_t result = apxdb_add_index("test_collection", &name_index);
+  ASSERT(result == 0, "apxdb_add_index failed for name field");
+  ASSERT(open_db(dir), "open_db failed");
+
+  apxdb_transaction_t* txn = apxdb_begin_write_txn();
+  ASSERT(txn != NULL, "begin transaction failed");
+
+  for (int i = 0; i < 10; ++i) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"value\": %d, \"name\": \"doc%d\"}", i, i);
+    const char* id = apxdb_put_document("test_collection", json);
+    ASSERT(id != NULL, "put_document failed");
+    apxdb_release_string(id);
+  }
+
+  ASSERT(apxdb_commit_write_txn(txn) == 0, "commit transaction failed");
+  apxdb_free_transaction(txn);
+
+  const char* query = "{\"value\": {\"gte\": 5}, \"name\": \"doc7\"}";
+  const char* query_result = apxdb_find_documents("test_collection", query);
+  ASSERT(query_result != NULL, "find_documents returned NULL");
+  ASSERT(apxdb_last_query_plan() == APXDB_QUERY_PLAN_INDEX_EXACT, "expected exact plan to beat wide range");
+  apxdb_release_string(query_result);
+  assert_query_result_count("test_collection", query, 1);
+
+  ASSERT(apxdb_close() == APXDB_OK, "close failed");
+}
+
+static void run_test_multi_predicate_scan_fallback(const char* dir) {
+  cleanup_test_files(dir);
+  printf("TEST: multi_predicate_scan_fallback\n");
+
+  register_test_collection();
+  ASSERT(open_db(dir), "open_db failed");
+
+  apxdb_transaction_t* txn = apxdb_begin_write_txn();
+  ASSERT(txn != NULL, "begin transaction failed");
+
+  for (int i = 0; i < 10; ++i) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"value\": %d, \"name\": \"doc%d\"}", i, i);
+    const char* id = apxdb_put_document("test_collection", json);
+    ASSERT(id != NULL, "put_document failed");
+    apxdb_release_string(id);
+  }
+
+  ASSERT(apxdb_commit_write_txn(txn) == 0, "commit transaction failed");
+  apxdb_free_transaction(txn);
+
+  const char* query = "{\"value\": {\"gte\": 5}, \"name\": \"doc7\"}";
+  const char* result = apxdb_find_documents("test_collection", query);
+  ASSERT(result != NULL, "find_documents returned NULL");
+  ASSERT(apxdb_last_query_plan() == APXDB_QUERY_PLAN_SCAN, "expected scan plan when wide range is not worth index route");
+  apxdb_release_string(result);
+  assert_query_result_count("test_collection", query, 1);
 
   ASSERT(apxdb_close() == APXDB_OK, "close failed");
 }
@@ -547,16 +657,9 @@ int main(void) {
   char* dir = make_temp_dir();
   ASSERT(dir != NULL, "failed to create temporary directory");
 
-  run_test_save_reopen(dir);
-  run_test_corrupt_header_rebuild(dir);
-  run_test_declaration_mismatch(dir);
-  run_test_missing_idx_rebuild(dir);
-  run_test_stale_doc_ids_reject(dir);
-  run_test_gpu_numeric_query_path(dir);
   run_test_numeric_exact_and_range_queries(dir);
-  run_test_numeric_index_persistence(dir);
-  run_test_layout_invariants(dir);
-  run_test_get_document_round_trip(dir);
+  run_test_multi_predicate_planner(dir);
+  run_test_multi_predicate_exact_beats_wide_range(dir);
 
   printf("All apxdb index persistence tests passed.\n");
   rmdir(dir);

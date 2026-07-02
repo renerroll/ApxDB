@@ -77,6 +77,7 @@ static atomic_int_fast32_t g_collection_counter = 0;
 static apxdb_transaction_t* g_active_transaction = NULL;
 static const size_t kGpuQueryMinDocs = 128;
 static const uint32_t kCollectionFileMagic = 0x41505843u; // 'APXC'
+static const double kIndexRangeSelectivityThreshold = 0.20;
 
 #if defined(APXDB_ENABLE_DIAGNOSTICS)
 static pthread_mutex_t g_query_diagnostics_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -131,10 +132,25 @@ typedef struct {
   uint8_t reserved[3];
 } apxdb_document_field_entry_t;
 
+typedef struct {
+  bool has_lower;
+  double lower_value;
+  bool lower_inclusive;
+  bool has_upper;
+  double upper_value;
+  bool upper_inclusive;
+} apxdb_numeric_range_bounds_t;
+
 static bool parse_numeric_value(const apxdb_json_value_t* value, double* out_value);
 static bool compare_numeric_operator(double doc_value, const char* op, double threshold);
 static bool serialize_document_blob(const apxdb_schema_t* schema, const apxdb_json_value_t* document, uint8_t** out_blob, size_t* out_blob_size);
 static apxdb_query_plan_t determine_query_plan(apxdb_collection_t* collection, const apxdb_json_member_t* member, apxdb_index_data_t** out_index);
+static bool predicate_is_exact_numeric(const apxdb_json_value_t* predicate);
+static bool extract_numeric_range_bounds(const apxdb_json_value_t* predicate, apxdb_numeric_range_bounds_t* out_bounds);
+static bool get_numeric_index_domain(apxdb_index_data_t* index, double* out_min_key, double* out_max_key);
+static bool estimate_numeric_range_selectivity(double min_key, double max_key, const apxdb_numeric_range_bounds_t* bounds, double* out_selectivity);
+static apxdb_query_plan_t choose_best_query_plan_for_direct_members(apxdb_collection_t* collection, const apxdb_json_value_t* query, const apxdb_json_member_t** out_best_member);
+static char** filter_doc_id_list_by_member(apxdb_collection_t* collection, char** doc_ids, size_t doc_count, const apxdb_json_member_t* member, size_t* out_count);
 static void set_last_query_plan(apxdb_query_plan_t plan);
 static bool serialize_document_blob_with_layout(const apxdb_collection_layout_t* layout, const apxdb_schema_t* schema, const apxdb_json_value_t* document, uint8_t** out_blob, size_t* out_blob_size);
 static bool compute_document_blob_size(const apxdb_schema_t* schema, const apxdb_json_value_t* document, size_t* out_size);
@@ -2161,6 +2177,143 @@ static bool parse_numeric_query_op(const apxdb_json_value_t* query_value, int* o
   return true;
 }
 
+static bool predicate_is_exact_numeric(const apxdb_json_value_t* predicate) {
+  if (!predicate || predicate->type != APXDB_JSON_OBJECT || predicate->u.object.count != 1) {
+    return false;
+  }
+  const apxdb_json_member_t* op_member = &predicate->u.object.members[0];
+  if (strcmp(op_member->name, "eq") != 0) {
+    return false;
+  }
+  double value;
+  return parse_numeric_value(op_member->value, &value);
+}
+
+static bool extract_numeric_range_bounds(const apxdb_json_value_t* predicate, apxdb_numeric_range_bounds_t* out_bounds) {
+  if (!predicate || !out_bounds || predicate->type != APXDB_JSON_OBJECT) {
+    return false;
+  }
+
+  out_bounds->has_lower = false;
+  out_bounds->has_upper = false;
+  out_bounds->lower_value = 0.0;
+  out_bounds->upper_value = 0.0;
+  out_bounds->lower_inclusive = false;
+  out_bounds->upper_inclusive = false;
+
+  for (size_t i = 0; i < predicate->u.object.count; ++i) {
+    const apxdb_json_member_t* op_member = &predicate->u.object.members[i];
+    double bound_value;
+    if (!parse_numeric_value(op_member->value, &bound_value)) {
+      return false;
+    }
+
+    if (strcmp(op_member->name, "gt") == 0) {
+      if (out_bounds->has_lower) {
+        return false;
+      }
+      out_bounds->has_lower = true;
+      out_bounds->lower_value = bound_value;
+      out_bounds->lower_inclusive = false;
+    } else if (strcmp(op_member->name, "gte") == 0) {
+      if (out_bounds->has_lower) {
+        return false;
+      }
+      out_bounds->has_lower = true;
+      out_bounds->lower_value = bound_value;
+      out_bounds->lower_inclusive = true;
+    } else if (strcmp(op_member->name, "lt") == 0) {
+      if (out_bounds->has_upper) {
+        return false;
+      }
+      out_bounds->has_upper = true;
+      out_bounds->upper_value = bound_value;
+      out_bounds->upper_inclusive = false;
+    } else if (strcmp(op_member->name, "lte") == 0) {
+      if (out_bounds->has_upper) {
+        return false;
+      }
+      out_bounds->has_upper = true;
+      out_bounds->upper_value = bound_value;
+      out_bounds->upper_inclusive = true;
+    } else {
+      return false;
+    }
+  }
+
+  return out_bounds->has_lower || out_bounds->has_upper;
+}
+
+static bool get_numeric_index_domain(apxdb_index_data_t* index, double* out_min_key, double* out_max_key) {
+  if (!index || !out_min_key || !out_max_key || index->entry_count == 0) {
+    return false;
+  }
+
+  bool found_any = false;
+  double min_key = 0.0;
+  double max_key = 0.0;
+
+  for (size_t i = 0; i < index->entry_count; ++i) {
+    double key_value;
+    if (index->entries[i].has_numeric_key) {
+      key_value = index->entries[i].numeric_key;
+    } else if (!parse_numeric_value((apxdb_json_value_t*)&(apxdb_json_value_t){.type = APXDB_JSON_STRING, .u.string_value = index->entries[i].key}, &key_value)) {
+      continue;
+    }
+    if (!found_any) {
+      found_any = true;
+      min_key = key_value;
+      max_key = key_value;
+    } else {
+      if (key_value < min_key) {
+        min_key = key_value;
+      }
+      if (key_value > max_key) {
+        max_key = key_value;
+      }
+    }
+  }
+
+  if (!found_any || max_key <= min_key) {
+    return false;
+  }
+  *out_min_key = min_key;
+  *out_max_key = max_key;
+  return true;
+}
+
+static bool estimate_numeric_range_selectivity(double min_key, double max_key, const apxdb_numeric_range_bounds_t* bounds, double* out_selectivity) {
+  if (!bounds || !out_selectivity || max_key <= min_key) {
+    return false;
+  }
+
+  double range_low = bounds->has_lower ? bounds->lower_value : min_key;
+  double range_high = bounds->has_upper ? bounds->upper_value : max_key;
+
+  if (range_low < min_key) {
+    range_low = min_key;
+  }
+  if (range_high > max_key) {
+    range_high = max_key;
+  }
+
+  double range_width = range_high - range_low;
+  double domain_width = max_key - min_key;
+  if (range_width < 0.0) {
+    *out_selectivity = 1.0;
+    return false;
+  }
+
+  double selectivity = range_width / domain_width;
+  if (selectivity < 0.0) {
+    selectivity = 0.0;
+  } else if (selectivity > 1.0) {
+    selectivity = 1.0;
+  }
+  *out_selectivity = selectivity;
+  return true;
+}
+
 static char** gpu_scan_numeric_docs(apxdb_collection_t* collection, const char* field_path, const apxdb_schema_field_t* field, int op_code, int32_t threshold, size_t* out_count) {
   if (!collection || !field_path || !field || !out_count) {
     return NULL;
@@ -3925,8 +4078,8 @@ static bool compare_numeric_operator(double doc_value, const char* op, double th
   return false;
 }
 
-static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_data_t* index, const char* op, double threshold, size_t* out_count) {
-  if (!collection || !index || !op || !out_count) {
+static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_data_t* index, const apxdb_numeric_range_bounds_t* bounds, size_t* out_count) {
+  if (!collection || !index || !bounds || !out_count) {
     return NULL;
   }
 
@@ -3946,9 +4099,18 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
     } else if (!parse_numeric_value((apxdb_json_value_t*)&(apxdb_json_value_t){.type = APXDB_JSON_STRING, .u.string_value = index->entries[i].key}, &key_value)) {
       continue;
     }
-    if (!compare_numeric_operator(key_value, op, threshold)) {
-      continue;
+
+    if (bounds->has_lower) {
+      if (key_value < bounds->lower_value || (!bounds->lower_inclusive && key_value == bounds->lower_value)) {
+        continue;
+      }
     }
+    if (bounds->has_upper) {
+      if (key_value > bounds->upper_value || (!bounds->upper_inclusive && key_value == bounds->upper_value)) {
+        continue;
+      }
+    }
+
     for (size_t j = 0; j < index->entries[i].doc_count; ++j) {
       if (result_count >= result_capacity) {
         size_t next_capacity = result_capacity == 0 ? 8 : result_capacity * 2;
@@ -3965,11 +4127,7 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
   }
 
   *out_count = result_count;
-  if (result_count > 0) {
-    update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
-  } else {
-    update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
-  }
+  update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
   set_last_query_metrics_result_count(result_count);
   set_last_query_metrics_total_ns(0);
   return results;
@@ -3987,10 +4145,33 @@ static apxdb_query_plan_t determine_query_plan(apxdb_collection_t* collection, c
     return APXDB_QUERY_PLAN_SCAN;
   }
 
-  if (member->value->type == APXDB_JSON_OBJECT && (*out_index)->definition.index_type == APXDB_INDEX_TYPE_VALUE && member->value->u.object.count == 1) {
-    const apxdb_json_member_t* op_member = &member->value->u.object.members[0];
-    double threshold;
-    if (parse_numeric_value(op_member->value, &threshold)) {
+  const apxdb_schema_field_t* query_field = apxdb_schema_find_field_path(collection->schema, member->name);
+  if (!query_field) {
+    return APXDB_QUERY_PLAN_SCAN;
+  }
+
+  if (predicate_is_exact_numeric(member->value) && query_field->type == APXDB_TYPE_INT) {
+    return APXDB_QUERY_PLAN_INDEX_EXACT;
+  }
+
+  if (member->value->type == APXDB_JSON_OBJECT && (*out_index)->definition.index_type == APXDB_INDEX_TYPE_VALUE && query_field->type == APXDB_TYPE_INT) {
+    apxdb_numeric_range_bounds_t bounds;
+    if (!extract_numeric_range_bounds(member->value, &bounds)) {
+      return APXDB_QUERY_PLAN_SCAN;
+    }
+
+    double min_key = 0.0;
+    double max_key = 0.0;
+    if (!get_numeric_index_domain(*out_index, &min_key, &max_key)) {
+      return APXDB_QUERY_PLAN_SCAN;
+    }
+
+    double selectivity = 1.0;
+    if (!estimate_numeric_range_selectivity(min_key, max_key, &bounds, &selectivity)) {
+      return APXDB_QUERY_PLAN_SCAN;
+    }
+
+    if (selectivity <= kIndexRangeSelectivityThreshold) {
       return APXDB_QUERY_PLAN_INDEX_RANGE;
     }
     return APXDB_QUERY_PLAN_SCAN;
@@ -4026,10 +4207,9 @@ static char** find_docs_for_member(apxdb_collection_t* collection, const apxdb_j
   apxdb_index_data_t* index = NULL;
   apxdb_query_plan_t plan = determine_query_plan(collection, member, &index);
   if (plan == APXDB_QUERY_PLAN_INDEX_RANGE && index) {
-    const apxdb_json_member_t* op_member = &member->value->u.object.members[0];
-    double threshold;
-    if (parse_numeric_value(op_member->value, &threshold)) {
-      return collect_docs_by_range(collection, index, op_member->name, threshold, out_count);
+    apxdb_numeric_range_bounds_t bounds;
+    if (extract_numeric_range_bounds(member->value, &bounds)) {
+      return collect_docs_by_range(collection, index, &bounds, out_count);
     }
   }
 
@@ -4072,6 +4252,86 @@ static char** find_docs_for_member(apxdb_collection_t* collection, const apxdb_j
   return scan_docs_for_member(collection, member, out_count);
 }
 
+static apxdb_query_plan_t choose_best_query_plan_for_direct_members(apxdb_collection_t* collection, const apxdb_json_value_t* query, const apxdb_json_member_t** out_best_member) {
+  if (!collection || !query || !out_best_member || query->type != APXDB_JSON_OBJECT || query->u.object.count <= 1) {
+    if (out_best_member) {
+      *out_best_member = NULL;
+    }
+    return APXDB_QUERY_PLAN_SCAN;
+  }
+
+  const apxdb_json_member_t* best_member = NULL;
+  apxdb_query_plan_t best_plan = APXDB_QUERY_PLAN_SCAN;
+
+  for (size_t i = 0; i < query->u.object.count; ++i) {
+    const apxdb_json_member_t* member = &query->u.object.members[i];
+    if (strcmp(member->name, "$and") == 0 || strcmp(member->name, "$or") == 0) {
+      *out_best_member = NULL;
+      return APXDB_QUERY_PLAN_SCAN;
+    }
+
+    apxdb_index_data_t* index = NULL;
+    apxdb_query_plan_t plan = determine_query_plan(collection, member, &index);
+    if (plan == APXDB_QUERY_PLAN_INDEX_EXACT) {
+      best_member = member;
+      best_plan = plan;
+      break;
+    }
+    if (plan == APXDB_QUERY_PLAN_INDEX_RANGE && best_plan != APXDB_QUERY_PLAN_INDEX_EXACT) {
+      best_member = member;
+      best_plan = plan;
+    }
+  }
+
+  *out_best_member = best_member;
+  return best_plan;
+}
+
+static char** filter_doc_id_list_by_member(apxdb_collection_t* collection, char** doc_ids, size_t doc_count, const apxdb_json_member_t* member, size_t* out_count) {
+  if (!collection || !doc_ids || !out_count || !member) {
+    return NULL;
+  }
+
+  char** result = NULL;
+  size_t result_capacity = 0;
+  *out_count = 0;
+
+  for (size_t i = 0; i < doc_count; ++i) {
+    apxdb_collection_document_t* doc = find_document_by_id(collection, doc_ids[i]);
+    if (!doc) {
+      continue;
+    }
+
+    const apxdb_schema_field_t* field = NULL;
+    const uint8_t* payload = NULL;
+    size_t payload_size = 0;
+    if (!get_collection_blob_field_payload(collection, doc->blob, doc->blob_size, member->name, &field, &payload, &payload_size)) {
+      continue;
+    }
+    if (!blob_field_matches_value(field, payload, payload_size, member->value)) {
+      continue;
+    }
+
+    if (*out_count >= result_capacity) {
+      size_t next_capacity = result_capacity == 0 ? 8 : result_capacity * 2;
+      char** next = (char**)realloc(result, next_capacity * sizeof(char*));
+      if (!next) {
+        free(result);
+        return NULL;
+      }
+      result = next;
+      result_capacity = next_capacity;
+    }
+    result[(*out_count)++] = doc_ids[i];
+  }
+
+  if (*out_count == 0) {
+    free(result);
+    return (char**)malloc(0);
+  }
+  return result;
+}
+
 static char** find_docs_by_query(apxdb_collection_t* collection, const apxdb_json_value_t* query, size_t* out_count, bool* out_owned) {
   if (!collection || !query || !out_count || !out_owned || query->type != APXDB_JSON_OBJECT) {
     return NULL;
@@ -4079,6 +4339,34 @@ static char** find_docs_by_query(apxdb_collection_t* collection, const apxdb_jso
   char** result = NULL;
   size_t result_count = 0;
   *out_owned = true;
+
+  const apxdb_json_member_t* best_member = NULL;
+  apxdb_query_plan_t best_plan = choose_best_query_plan_for_direct_members(collection, query, &best_member);
+  if (best_member && best_plan != APXDB_QUERY_PLAN_SCAN) {
+    size_t best_count = 0;
+    char** best_ids = find_docs_for_member(collection, best_member, &best_count);
+    if (!best_ids) {
+      return NULL;
+    }
+
+    for (size_t i = 0; i < query->u.object.count; ++i) {
+      const apxdb_json_member_t* member = &query->u.object.members[i];
+      if (member == best_member) {
+        continue;
+      }
+      size_t filtered_count = 0;
+      char** filtered_ids = filter_doc_id_list_by_member(collection, best_ids, best_count, member, &filtered_count);
+      free(best_ids);
+      if (!filtered_ids) {
+        return NULL;
+      }
+      best_ids = filtered_ids;
+      best_count = filtered_count;
+    }
+
+    *out_count = best_count;
+    return best_ids;
+  }
 
   for (size_t i = 0; i < query->u.object.count; ++i) {
     const apxdb_json_member_t* member = &query->u.object.members[i];
