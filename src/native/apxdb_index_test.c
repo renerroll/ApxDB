@@ -364,11 +364,24 @@ static void run_test_numeric_exact_and_range_queries(const char* dir) {
   ASSERT(result == 0, "commit transaction failed");
   apxdb_free_transaction(txn);
 
-  assert_query_result_count("test_collection", "{\"value\": 5}", 3);
-  assert_query_result_count("test_collection", "{\"value\": {\"gte\": 5}}", 7);
+  const char* query1 = "{\"value\": 5}";
+  const char* result1 = apxdb_find_documents("test_collection", query1);
+  ASSERT(result1 != NULL, "find_documents returned NULL");
+  ASSERT(apxdb_last_query_path() == APXDB_QUERY_INDEX_EXACT, "expected exact index path");
+  apxdb_release_string(result1);
+  assert_query_result_count("test_collection", query1, 3);
+
+  const char* query2 = "{\"value\": {\"gte\": 5}}";
+  const char* result2 = apxdb_find_documents("test_collection", query2);
+  ASSERT(result2 != NULL, "find_documents returned NULL");
+  ASSERT(apxdb_last_query_path() == APXDB_QUERY_INDEX_RANGE, "expected range index path");
+  apxdb_release_string(result2);
+  assert_query_result_count("test_collection", query2, 7);
+
   assert_query_result_count("test_collection", "{\"value\": {\"lt\": 3}}", 3);
   assert_query_result_count("test_collection", "{\"value\": {\"gt\": 5}}", 4);
   assert_query_result_count("test_collection", "{\"value\": {\"lte\": 5}}", 6);
+  assert_query_result_count("test_collection", "{\"name\": \"doc0\"}", 1);
 
   ASSERT(apxdb_close() == APXDB_OK, "close failed");
 }

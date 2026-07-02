@@ -3913,12 +3913,13 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
   }
 
   reset_last_query_metrics();
-  update_last_query_metrics_path(APXDB_QUERY_CPU_ONLY);
+  update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
 
   char** results = NULL;
   size_t result_count = 0;
   size_t result_capacity = 0;
 
+  set_last_query_diagnostics(APXDB_QUERY_INDEX_RANGE, 0);
   for (size_t i = 0; i < index->entry_count; ++i) {
     double key_value;
     if (index->entries[i].has_numeric_key) {
@@ -3945,6 +3946,11 @@ static char** collect_docs_by_range(apxdb_collection_t* collection, apxdb_index_
   }
 
   *out_count = result_count;
+  if (result_count > 0) {
+    update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
+  } else {
+    update_last_query_metrics_path(APXDB_QUERY_INDEX_RANGE);
+  }
   set_last_query_metrics_result_count(result_count);
   set_last_query_metrics_total_ns(0);
   return results;
@@ -3970,10 +3976,11 @@ static char** find_docs_for_member(apxdb_collection_t* collection, const apxdb_j
     } else {
       double numeric_value;
       if (parse_numeric_value(member->value, &numeric_value)) {
+        set_last_query_diagnostics(APXDB_QUERY_INDEX_EXACT, 0);
         apxdb_index_entry_t* entry = find_index_entry_by_numeric(index, numeric_value);
         if (entry) {
           reset_last_query_metrics();
-          update_last_query_metrics_path(APXDB_QUERY_CPU_ONLY);
+          update_last_query_metrics_path(APXDB_QUERY_INDEX_EXACT);
           *out_count = entry->doc_count;
           set_last_query_metrics_result_count(*out_count);
           set_last_query_metrics_total_ns(0);
@@ -3982,11 +3989,12 @@ static char** find_docs_for_member(apxdb_collection_t* collection, const apxdb_j
       }
       char* key = json_value_to_string(member->value);
       if (key) {
+        set_last_query_diagnostics(APXDB_QUERY_INDEX_EXACT, 0);
         apxdb_index_entry_t* entry = find_index_entry(index, key);
         free(key);
         if (entry) {
           reset_last_query_metrics();
-          update_last_query_metrics_path(APXDB_QUERY_CPU_ONLY);
+          update_last_query_metrics_path(APXDB_QUERY_INDEX_EXACT);
           *out_count = entry->doc_count;
           set_last_query_metrics_result_count(*out_count);
           set_last_query_metrics_total_ns(0);
