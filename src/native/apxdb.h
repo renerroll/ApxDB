@@ -51,6 +51,15 @@ typedef enum {
   APXDB_QUERY_PLAN_INDEX_RANGE,
 } apxdb_query_plan_t;
 
+typedef enum {
+  APXDB_QUERY_PLAN_REASON_UNSPECIFIED = 0,
+  APXDB_QUERY_PLAN_REASON_EXACT,
+  APXDB_QUERY_PLAN_REASON_RANGE_NARROW,
+  APXDB_QUERY_PLAN_REASON_RANGE_WIDE,
+  APXDB_QUERY_PLAN_REASON_NO_DOMAIN,
+  APXDB_QUERY_PLAN_REASON_UNSUPPORTED,
+} apxdb_query_plan_reason_t;
+
 enum {
   APXDB_OK = 0,
   APXDB_OK_GPU_FALLBACK = 10,
@@ -82,6 +91,13 @@ typedef struct {
   uint64_t gpu_exec_ns;
   uint64_t total_ns;
   apxdb_query_path_t path;
+  apxdb_query_plan_t plan;
+  apxdb_query_plan_reason_t plan_reason;
+  double selectivity_estimate;
+  double numeric_domain_min;
+  double numeric_domain_max;
+  double range_lower;
+  double range_upper;
 } apxdb_query_metrics_t;
 
 typedef enum {

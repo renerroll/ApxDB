@@ -149,6 +149,7 @@ static bool predicate_is_exact_numeric(const apxdb_json_value_t* predicate);
 static bool extract_numeric_range_bounds(const apxdb_json_value_t* predicate, apxdb_numeric_range_bounds_t* out_bounds);
 static bool get_numeric_index_domain(apxdb_index_data_t* index, double* out_min_key, double* out_max_key);
 static bool estimate_numeric_range_selectivity(double min_key, double max_key, const apxdb_numeric_range_bounds_t* bounds, double* out_selectivity);
+static void set_last_query_plan_diagnostics(apxdb_query_plan_reason_t reason, double selectivity, double domain_min, double domain_max, double range_lower, double range_upper);
 static apxdb_query_plan_t choose_best_query_plan_for_direct_members(apxdb_collection_t* collection, const apxdb_json_value_t* query, const apxdb_json_member_t** out_best_member);
 static char** filter_doc_id_list_by_member(apxdb_collection_t* collection, char** doc_ids, size_t doc_count, const apxdb_json_member_t* member, size_t* out_count);
 static void set_last_query_plan(apxdb_query_plan_t plan);
@@ -3702,6 +3703,24 @@ static void reset_last_query_metrics(void) {
   pthread_mutex_lock(&g_query_diagnostics_mutex);
   memset(&g_last_query_metrics, 0, sizeof(g_last_query_metrics));
   g_last_query_metrics.path = APXDB_QUERY_CPU_ONLY;
+  g_last_query_metrics.plan = APXDB_QUERY_PLAN_SCAN;
+  g_last_query_metrics.plan_reason = APXDB_QUERY_PLAN_REASON_UNSPECIFIED;
+  g_last_query_metrics.selectivity_estimate = 0.0;
+  g_last_query_metrics.numeric_domain_min = 0.0;
+  g_last_query_metrics.numeric_domain_max = 0.0;
+  g_last_query_metrics.range_lower = 0.0;
+  g_last_query_metrics.range_upper = 0.0;
+  pthread_mutex_unlock(&g_query_diagnostics_mutex);
+}
+
+static void set_last_query_plan_diagnostics(apxdb_query_plan_reason_t reason, double selectivity, double domain_min, double domain_max, double range_lower, double range_upper) {
+  pthread_mutex_lock(&g_query_diagnostics_mutex);
+  g_last_query_metrics.plan_reason = reason;
+  g_last_query_metrics.selectivity_estimate = selectivity;
+  g_last_query_metrics.numeric_domain_min = domain_min;
+  g_last_query_metrics.numeric_domain_max = domain_max;
+  g_last_query_metrics.range_lower = range_lower;
+  g_last_query_metrics.range_upper = range_upper;
   pthread_mutex_unlock(&g_query_diagnostics_mutex);
 }
 
@@ -4151,6 +4170,7 @@ static apxdb_query_plan_t determine_query_plan(apxdb_collection_t* collection, c
   }
 
   if (predicate_is_exact_numeric(member->value) && query_field->type == APXDB_TYPE_INT) {
+    set_last_query_plan_diagnostics(APXDB_QUERY_PLAN_REASON_EXACT, 0.0, 0.0, 0.0, 0.0, 0.0);
     return APXDB_QUERY_PLAN_INDEX_EXACT;
   }
 
@@ -4172,17 +4192,21 @@ static apxdb_query_plan_t determine_query_plan(apxdb_collection_t* collection, c
     }
 
     if (selectivity <= kIndexRangeSelectivityThreshold) {
+      set_last_query_plan_diagnostics(APXDB_QUERY_PLAN_REASON_RANGE_NARROW, selectivity, min_key, max_key, bounds.lower_value, bounds.upper_value);
       return APXDB_QUERY_PLAN_INDEX_RANGE;
     }
+    set_last_query_plan_diagnostics(APXDB_QUERY_PLAN_REASON_RANGE_WIDE, selectivity, min_key, max_key, bounds.lower_value, bounds.upper_value);
     return APXDB_QUERY_PLAN_SCAN;
   }
 
   double numeric_value;
   if (parse_numeric_value(member->value, &numeric_value)) {
+    set_last_query_plan_diagnostics(APXDB_QUERY_PLAN_REASON_EXACT, 0.0, 0.0, 0.0, 0.0, 0.0);
     return APXDB_QUERY_PLAN_INDEX_EXACT;
   }
 
   if (member->value->type == APXDB_JSON_STRING) {
+    set_last_query_plan_diagnostics(APXDB_QUERY_PLAN_REASON_EXACT, 0.0, 0.0, 0.0, 0.0, 0.0);
     return APXDB_QUERY_PLAN_INDEX_EXACT;
   }
 
@@ -4193,6 +4217,7 @@ static void set_last_query_plan(apxdb_query_plan_t plan) {
 #if defined(APXDB_ENABLE_DIAGNOSTICS)
   pthread_mutex_lock(&g_query_diagnostics_mutex);
   g_last_query_plan = plan;
+  g_last_query_metrics.plan = plan;
   pthread_mutex_unlock(&g_query_diagnostics_mutex);
 #else
   (void)plan;

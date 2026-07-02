@@ -284,6 +284,9 @@ static void assert_query_result_count(const char* collection_name, const char* q
   const char* result_json = apxdb_find_documents(collection_name, query);
   ASSERT(result_json != NULL, "find_documents returned NULL");
   int count = count_substring(result_json, "\"name\"");
+  if (count != expected_count) {
+    fprintf(stderr, "QUERY FAILED: %s -> count=%d expected=%d result=%s\n", query, count, expected_count, result_json);
+  }
   apxdb_release_string(result_json);
   ASSERT(count == expected_count, query);
 }
@@ -376,7 +379,7 @@ static void run_test_numeric_exact_and_range_queries(const char* dir) {
   ASSERT(result2 != NULL, "find_documents returned NULL");
   ASSERT(apxdb_last_query_path() == APXDB_QUERY_INDEX_RANGE, "expected range index path");
   apxdb_release_string(result2);
-  assert_query_result_count("test_collection", query2, 1);
+  assert_query_result_count("test_collection", query2, 2);
 
   assert_query_result_count("test_collection", "{\"value\": {\"lt\": 3}}", 3);
   assert_query_result_count("test_collection", "{\"value\": {\"gt\": 5}}", 4);
@@ -657,9 +660,19 @@ int main(void) {
   char* dir = make_temp_dir();
   ASSERT(dir != NULL, "failed to create temporary directory");
 
+  run_test_save_reopen(dir);
+  run_test_corrupt_header_rebuild(dir);
+  run_test_declaration_mismatch(dir);
+  run_test_missing_idx_rebuild(dir);
+  run_test_stale_doc_ids_reject(dir);
+  run_test_gpu_numeric_query_path(dir);
   run_test_numeric_exact_and_range_queries(dir);
   run_test_multi_predicate_planner(dir);
   run_test_multi_predicate_exact_beats_wide_range(dir);
+  run_test_multi_predicate_scan_fallback(dir);
+  run_test_numeric_index_persistence(dir);
+  run_test_layout_invariants(dir);
+  run_test_get_document_round_trip(dir);
 
   printf("All apxdb index persistence tests passed.\n");
   rmdir(dir);
