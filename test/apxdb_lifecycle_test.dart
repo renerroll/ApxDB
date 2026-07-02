@@ -26,6 +26,10 @@ void main() {
       lastQueryPath: () => ApxDbQueryPath.cpuOnly,
       lastQueryDocCount: () => 0,
       createDocument: (Pointer<Utf8> json) => nullptr,
+      createDocumentBytes: (Pointer<Uint8> bytes, int length) => nullptr,
+      getDocumentBytes: (Pointer<Utf8> id, Pointer<IntPtr> outLength) =>
+          nullptr,
+      releaseBytes: (Pointer<Uint8> bytes) {},
       findDocument: (Pointer<Utf8> query) => nullptr,
       releaseString: (Pointer<Utf8> value) {},
     );
@@ -62,6 +66,10 @@ void main() {
       lastQueryPath: () => ApxDbQueryPath.cpuOnly,
       lastQueryDocCount: () => 0,
       createDocument: (Pointer<Utf8> json) => nullptr,
+      createDocumentBytes: (Pointer<Uint8> bytes, int length) => nullptr,
+      getDocumentBytes: (Pointer<Utf8> id, Pointer<IntPtr> outLength) =>
+          nullptr,
+      releaseBytes: (Pointer<Uint8> bytes) {},
       findDocument: (Pointer<Utf8> query) => nullptr,
       releaseString: (Pointer<Utf8> value) {},
     ));
@@ -88,6 +96,10 @@ void main() {
       lastQueryPath: () => ApxDbQueryPath.cpuOnly,
       lastQueryDocCount: () => 0,
       createDocument: (Pointer<Utf8> json) => nullptr,
+      createDocumentBytes: (Pointer<Uint8> bytes, int length) => nullptr,
+      getDocumentBytes: (Pointer<Utf8> id, Pointer<IntPtr> outLength) =>
+          nullptr,
+      releaseBytes: (Pointer<Uint8> bytes) {},
       findDocument: (Pointer<Utf8> query) => nullptr,
       releaseString: (Pointer<Utf8> value) {},
     );

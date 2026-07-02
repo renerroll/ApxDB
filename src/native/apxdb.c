@@ -160,6 +160,7 @@ static void transition_to_closed(void) {
   free_documents();
   apxdb_collection_unregister_all();
   apxdb_schema_unregister_all();
+  apxdb_unregister_all_schemas();
   free(g_storage_directory);
   g_storage_directory = NULL;
   set_state(APXDB_STATE_CLOSED);
@@ -170,6 +171,7 @@ static void cleanup_partial_open(void) {
   free_documents();
   apxdb_collection_unregister_all();
   apxdb_schema_unregister_all();
+  apxdb_unregister_all_schemas();
   free(g_storage_directory);
   g_storage_directory = NULL;
   g_initialized = false;

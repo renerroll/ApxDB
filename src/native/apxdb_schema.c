@@ -1,4 +1,4 @@
-#include "apxdb_schema.h"
+#include "apxdb.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -6,6 +6,10 @@
 static const apxdb_schema_t** g_schema_registry = NULL;
 static size_t g_schema_registry_count = 0;
 static size_t g_schema_registry_capacity = 0;
+
+static const apxdb_collection_schema_t** g_collection_schema_registry = NULL;
+static size_t g_collection_schema_registry_count = 0;
+static size_t g_collection_schema_registry_capacity = 0;
 
 static bool grow_registry(void) {
   if (g_schema_registry_count >= g_schema_registry_capacity) {
@@ -57,6 +61,79 @@ void apxdb_schema_unregister_all(void) {
   g_schema_registry = NULL;
   g_schema_registry_count = 0;
   g_schema_registry_capacity = 0;
+}
+
+static bool grow_collection_schema_registry(void) {
+  if (g_collection_schema_registry_count >= g_collection_schema_registry_capacity) {
+    size_t next_capacity = g_collection_schema_registry_capacity == 0 ? 8 : g_collection_schema_registry_capacity * 2;
+    const apxdb_collection_schema_t** next = (const apxdb_collection_schema_t**)realloc(
+        g_collection_schema_registry, next_capacity * sizeof(apxdb_collection_schema_t*));
+    if (!next) {
+      return false;
+    }
+    g_collection_schema_registry = next;
+    g_collection_schema_registry_capacity = next_capacity;
+  }
+  return true;
+}
+
+static bool is_valid_collection_schema(const apxdb_collection_schema_t* schema) {
+  if (!schema || schema->struct_size < sizeof(apxdb_collection_schema_t) || schema->version != 1) {
+    return false;
+  }
+  if (!schema->name || schema->field_count == 0 || !schema->fields) {
+    return false;
+  }
+  return true;
+}
+
+const apxdb_collection_schema_t* apxdb_register_schema(const apxdb_collection_schema_t* schema) {
+  if (!is_valid_collection_schema(schema)) {
+    return NULL;
+  }
+
+  for (size_t index = 0; index < g_collection_schema_registry_count; ++index) {
+    const apxdb_collection_schema_t* existing = g_collection_schema_registry[index];
+    if (existing->collection_id == schema->collection_id ||
+        strcmp(existing->name, schema->name) == 0) {
+      return existing == schema ? existing : NULL;
+    }
+  }
+
+  if (!grow_collection_schema_registry()) {
+    return NULL;
+  }
+
+  g_collection_schema_registry[g_collection_schema_registry_count++] = schema;
+  return schema;
+}
+
+const apxdb_collection_schema_t* apxdb_find_collection_schema_by_name(const char* name) {
+  if (!name) {
+    return NULL;
+  }
+  for (size_t index = 0; index < g_collection_schema_registry_count; ++index) {
+    if (strcmp(g_collection_schema_registry[index]->name, name) == 0) {
+      return g_collection_schema_registry[index];
+    }
+  }
+  return NULL;
+}
+
+const apxdb_collection_schema_t* apxdb_find_collection_schema_by_id(uint32_t collection_id) {
+  for (size_t index = 0; index < g_collection_schema_registry_count; ++index) {
+    if (g_collection_schema_registry[index]->collection_id == collection_id) {
+      return g_collection_schema_registry[index];
+    }
+  }
+  return NULL;
+}
+
+void apxdb_unregister_all_schemas(void) {
+  free(g_collection_schema_registry);
+  g_collection_schema_registry = NULL;
+  g_collection_schema_registry_count = 0;
+  g_collection_schema_registry_capacity = 0;
 }
 
 const apxdb_schema_field_t* apxdb_schema_find_field(const apxdb_schema_t* schema, const char* field_name) {

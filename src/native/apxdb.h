@@ -1,6 +1,7 @@
 #ifndef APXDB_NATIVE_H
 #define APXDB_NATIVE_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "apxdb_schema.h"
@@ -74,6 +75,77 @@ typedef struct {
   uint64_t total_ns;
   apxdb_query_path_t path;
 } apxdb_query_metrics_t;
+
+typedef enum {
+  APXDB_FIELD_INT32 = 0,
+  APXDB_FIELD_INT64,
+  APXDB_FIELD_BOOL,
+  APXDB_FIELD_DOUBLE,
+  APXDB_FIELD_STRING,
+  APXDB_FIELD_BYTES,
+} apxdb_field_type_t;
+
+typedef enum {
+  APXDB_STORAGE_FIXED = 0,
+  APXDB_STORAGE_VARIABLE,
+} apxdb_storage_kind_t;
+
+typedef enum {
+  APXDB_INDEX_EXACT = 0,
+  APXDB_INDEX_RANGE,
+  APXDB_INDEX_COMPOSITE,
+} apxdb_index_kind_t;
+
+enum {
+  APXDB_FIELD_FLAG_NULLABLE = 1u << 0,
+  APXDB_FIELD_FLAG_INDEXABLE = 1u << 1,
+  APXDB_FIELD_FLAG_INDEXED = 1u << 2,
+  APXDB_FIELD_FLAG_UNIQUE = 1u << 3,
+  APXDB_FIELD_FLAG_FIXED_SIZE = 1u << 4,
+};
+
+enum {
+  APXDB_INDEX_FLAG_UNIQUE = 1u << 0,
+  APXDB_INDEX_FLAG_DESCENDING = 1u << 1,
+};
+
+typedef struct apxdb_field_schema_t {
+  uint32_t struct_size;
+  uint32_t version;
+  uint32_t field_id;
+  const char* name;
+  apxdb_field_type_t type;
+  uint32_t flags;
+  uint32_t type_size;
+  apxdb_storage_kind_t storage_kind;
+} apxdb_field_schema_t;
+
+typedef struct apxdb_index_schema_t {
+  uint32_t struct_size;
+  uint32_t version;
+  uint32_t index_id;
+  const char* name;
+  apxdb_index_kind_t kind;
+  uint32_t flags;
+  uint32_t field_count;
+  const uint32_t* field_ids;
+} apxdb_index_schema_t;
+
+typedef struct apxdb_collection_schema_t {
+  uint32_t struct_size;
+  uint32_t version;
+  uint32_t collection_id;
+  const char* name;
+  uint32_t field_count;
+  const apxdb_field_schema_t* fields;
+  uint32_t index_count;
+  const apxdb_index_schema_t* indexes;
+} apxdb_collection_schema_t;
+
+const apxdb_collection_schema_t* apxdb_register_schema(const apxdb_collection_schema_t* schema);
+const apxdb_collection_schema_t* apxdb_find_collection_schema_by_name(const char* name);
+const apxdb_collection_schema_t* apxdb_find_collection_schema_by_id(uint32_t collection_id);
+void apxdb_unregister_all_schemas(void);
 
 int32_t apxdb_last_query_path(void);
 uint32_t apxdb_last_query_doc_count(void);
